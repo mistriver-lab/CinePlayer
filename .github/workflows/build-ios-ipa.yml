@@ -7,12 +7,14 @@ on:
 
 jobs:
   build-ios:
-    name: Build CinePlayer iOS (Unsigned IPA)
+    name: Build CinePlayer iOS v1.0.1 (Unsigned IPA)
     runs-on: macos-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout CinePlayer v1.0.1
         uses: actions/checkout@v4
+        with:
+          ref: v1.0.1
 
       - name: Select newest available Xcode
         run: |
@@ -22,13 +24,16 @@ jobs:
           sudo xcode-select -s "$BEST_XCODE/Contents/Developer"
           xcodebuild -version
 
-      - name: Download and verify v2.0.0 Frameworks.zip
+      - name: Download and extract v1.0.0 Frameworks.zip
         run: |
-          curl --fail --location -O https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip
-          curl --fail --location -O https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip.sha256
-          shasum -a 256 -c Frameworks.zip.sha256
+          curl --fail --location -o Frameworks.zip https://github.com/cinemore/CinePlayer/releases/download/v1.0.0/Frameworks.zip
           unzip -q Frameworks.zip
+          if [ ! -d Frameworks ]; then
+            mkdir -p Frameworks
+            mv *.xcframework Frameworks/
+          fi
           ls -la Frameworks
+          test -d Frameworks/CinePlayerSDK.xcframework
 
       - name: Resolve Swift Package dependencies
         run: xcodebuild -resolvePackageDependencies -project CinePlayer.xcodeproj -scheme CinePlayer -skipPackagePluginValidation -skipMacroValidation
@@ -54,8 +59,8 @@ jobs:
           mkdir -p Payload
           cp -R build/Release-iphoneos/CinePlayer.app Payload/
           ls -la Payload/CinePlayer.app/Frameworks || true
-          zip -qry "CinePlayer-v2.0.0-b${{ github.run_number }}-unsigned.ipa" Payload
-          ls -lh CinePlayer-v2.0.0-b*-unsigned.ipa
+          zip -qry "CinePlayer-v1.0.1-b${{ github.run_number }}-unsigned.ipa" Payload
+          ls -lh CinePlayer-v1.0.1-b*-unsigned.ipa
 
       - name: Upload CinePlayer-unsigned-ipa
         uses: actions/upload-artifact@v4
