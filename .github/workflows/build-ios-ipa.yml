@@ -113,6 +113,10 @@ jobs:
             set +e
 
             {
+              echo "=== App Root Contents ==="
+              ls -la "$APP_PATH" 2>&1 || true
+              echo "=== App Bundles / Weights / Metallib ==="
+              find "$APP_PATH" -maxdepth 3 \( -name "*.bundle" -o -name "*.rmw" -o -name "*.metallib" \) 2>&1 || true
               echo "=== otool -L ==="
               otool -L "$APP_PATH/CinePlayer" 2>&1 || true
               echo "=== App Frameworks ==="
@@ -134,11 +138,11 @@ jobs:
               echo "=== simctl launchctl list ==="
               xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i -E "cineplayer|glassmpv" || true
               echo "=== DiagnosticReports (CinePlayer / GlassMPV / recent .ips) ==="
-              find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 2 -type f \( -name "*CinePlayer*" -o -name "*GlassMPV*" -o \( -name "*.ips" -mmin -10 \) \) 2>/dev/null | sort || true
+              find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -maxdepth 2 -type f \( -name "*CinePlayer*" -o -name "*GlassMPV*" -o \( -name "*.ips" -mmin -10 \) \) 2>/dev/null | sort || true
             } >> sim-smoke-report/process.log 2>&1 || true
 
             mkdir -p sim-smoke-report/DiagnosticReports
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 2 -type f \( -name "*CinePlayer*" -o -name "*GlassMPV*" -o \( -name "*.ips" -mmin -10 \) \) -exec cp {} sim-smoke-report/DiagnosticReports/ \; 2>/dev/null || true
+            find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -maxdepth 2 -type f \( -name "*CinePlayer*" -o -name "*GlassMPV*" -o \( -name "*.ips" -mmin -10 \) \) -exec cp {} sim-smoke-report/DiagnosticReports/ \; 2>/dev/null || true
             cp sim-smoke-report/DiagnosticReports/* sim-smoke-report/ 2>/dev/null || true
 
             LATEST_IPS=$(ls -t sim-smoke-report/DiagnosticReports/*.ips 2>/dev/null | head -n 1 || true)
@@ -238,7 +242,9 @@ jobs:
             local wait_secs="$2"
             local shot_name="$3"
             shift 3
-            echo "=== Smoke Round: $label ===" | tee -a sim-smoke-report/launch.log
+            local round_start
+            round_start=$(date "+%Y-%m-%d %H:%M:%S")
+            echo "=== Smoke Round: $label ($round_start) ===" | tee -a sim-smoke-report/launch.log
             xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" || true
             sleep 1
             xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" "$@" >> sim-smoke-report/launch.log 2>&1
@@ -250,19 +256,20 @@ jobs:
               echo "Round $label FAILED: CinePlayer process not running!" | tee -a sim-smoke-report/process.log
               SMOKE_FAILED=1
             fi
+            xcrun simctl spawn "$SIM_UDID" log show --start "$round_start" --style compact --predicate 'process == "CinePlayer" OR eventMessage CONTAINS[c] "CinePlayer" OR eventMessage CONTAINS[c] "cn.com.cinemore.cineplayer" OR eventMessage CONTAINS[c] "rife" OR eventMessage CONTAINS[c] "MPSGraph" OR eventMessage CONTAINS[c] "Fatal"' 2>&1 | tail -n 400 > "sim-smoke-report/round-${label}.log" || true
           }
 
           # Round 2: Baseline + HUD
-          run_smoke_round "baseline" 7 "sim-02-open-local-video.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeTag baseline
+          run_smoke_round "baseline" 10 "sim-02-open-local-video.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeTag baseline
 
           # Round 3: Anime4K SR
-          run_smoke_round "anime4k" 7 "sim-03-smoke-sr.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy anime4k -smokeTag anime4k
+          run_smoke_round "anime4k" 10 "sim-03-smoke-sr.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy anime4k -smokeTag anime4k
 
           # Round 4: RIFE VFI
-          run_smoke_round "rife" 8 "sim-04-smoke-vfi.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy rife -smokeTag rife
+          run_smoke_round "rife" 12 "sim-04-smoke-vfi.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy rife -smokeTag rife
 
           # Round 5: OpticalFlow
-          run_smoke_round "opticalFlow" 8 "sim-04b-smoke-opticalflow.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy opticalFlow -smokeTag opticalFlow
+          run_smoke_round "opticalFlow" 14 "sim-04b-smoke-opticalflow.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy opticalFlow -smokeTag opticalFlow
 
           xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" || true
           sleep 1
