@@ -109,6 +109,7 @@ struct PlayerControlView: View {
     @State private var didRequestHistoryThumbnail = false
     @State private var lastHistoryProgressSecond = -1
     @State private var lastHistoryDurationSecond = -1
+    @State private var didApplySmokeStrategy = false
 
     #if !os(tvOS) && !os(visionOS)
         @State private var showLanguagePackDownloadSheet = false
@@ -133,6 +134,20 @@ struct PlayerControlView: View {
                                 if playerMaskModel.isMaskShow {
                                     controlOverlay(geometry: overlayGeometry)
                                         .transition(.opacity)
+                                }
+
+                                if playerControlModel.showStatsHUD {
+                                    VStack {
+                                        HStack {
+                                            PlayerStatsHUDView()
+                                                .environmentObject(playerModel.playerCoordinator)
+                                            Spacer()
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(.top, 52)
+                                    .padding(.leading, 16)
+                                    .allowsHitTesting(false)
                                 }
 
                                 if playerControlModel.showMediaInfoCard {
@@ -254,6 +269,22 @@ struct PlayerControlView: View {
                         controlOverlay(geometry: geometry)
                             .transition(.opacity)
                     }
+
+                    #if !os(tvOS)
+                    if playerControlModel.showStatsHUD {
+                        VStack {
+                            HStack {
+                                PlayerStatsHUDView()
+                                    .environmentObject(playerModel.playerCoordinator)
+                                Spacer()
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, geometry.size.height > geometry.size.width ? 100 : 72)
+                        .padding(.leading, 16)
+                        .allowsHitTesting(false)
+                    }
+                    #endif
 
                     if playerControlModel.showMediaInfoCard {
                         Color.black.opacity(mediaInfoMaskOpacity)
@@ -474,6 +505,34 @@ struct PlayerControlView: View {
                                         height: nil
                                     )
                                 }
+
+                                #if DEBUG
+                                if UserDefaults.standard.bool(forKey: "smokeHUD") {
+                                    playerControlModel.showStatsHUD = true
+                                }
+                                if !didApplySmokeStrategy,
+                                   let rawStrategy = UserDefaults.standard.string(forKey: "smokeStrategy"),
+                                   !rawStrategy.isEmpty
+                                {
+                                    didApplySmokeStrategy = true
+                                    let enhancement = PlayerEnhancementModel.shared
+                                    switch rawStrategy {
+                                    case "anime4k":
+                                        enhancement.videoEnhancementStrategy = .anime4k
+                                        enhancement.anime4kEnabled = true
+                                    case "rife":
+                                        enhancement.rifeTierPreference = .fast
+                                        enhancement.videoEnhancementStrategy = .rife
+                                    case "opticalFlow":
+                                        enhancement.videoEnhancementStrategy = .opticalFlow
+                                    case "metalFX":
+                                        enhancement.videoEnhancementStrategy = .metalFX
+                                        enhancement.metalFXSuperResolutionEnabled = true
+                                    default:
+                                        break
+                                    }
+                                }
+                                #endif
                             #endif
                             playerModel.playerCoordinator.controller?
                                 .prewarmScrubThumbnailSession()
@@ -756,6 +815,7 @@ struct PlayerControlView: View {
             didRequestHistoryThumbnail = false
             lastHistoryProgressSecond = -1
             lastHistoryDurationSecond = -1
+            didApplySmokeStrategy = false
             #if os(macOS)
                 // 切换到新的视频源时，允许重新根据新视频尺寸应用一次窗口布局
                 hasAppliedMacWindowLayout = false

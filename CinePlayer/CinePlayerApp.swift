@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import SwiftData
 #if os(iOS)
@@ -24,7 +25,7 @@ struct CinePlayerApp: App {
 
     var body: some Scene {
         #if os(macOS)
-        Window("CinePlayer", id: "main-window") {
+        Window("GlassMPV", id: "main-window") {
             rootContentView
         }
         .commands {
@@ -65,7 +66,32 @@ struct CinePlayerApp: App {
                     if url.isFileURL {
                         sessionStore.open(url: url)
                     }
+                    #if DEBUG
+                    if !url.isFileURL,
+                       url.scheme == "glassmpv" || url.scheme == "cineplayer",
+                       url.host(percentEncoded: false) == "smoke",
+                       let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                       let name = components.queryItems?.first(where: { $0.name == "file" })?.value,
+                       !name.isEmpty,
+                       let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                    {
+                        let targetURL = docs.appendingPathComponent((name as NSString).lastPathComponent)
+                        sessionStore.open(url: targetURL)
+                    }
+                    #endif
                 }
+                #if DEBUG
+                .task {
+                    guard sessionStore.currentSource == nil,
+                          let name = UserDefaults.standard.string(forKey: "smokeFile"),
+                          !name.isEmpty,
+                          let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                    else { return }
+                    try? await Task.sleep(for: .milliseconds(500))
+                    let targetURL = docs.appendingPathComponent((name as NSString).lastPathComponent)
+                    sessionStore.open(url: targetURL)
+                }
+                #endif
             #endif
     }
 

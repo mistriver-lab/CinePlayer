@@ -4,7 +4,7 @@
     {
       "identity" : "anime4k-metal",
       "kind" : "remoteSourceControl",
-      "location" : "git@github.com:cinemore/anime4k-metal.git",
+      "location" : "https://github.com/cinemore/anime4k-metal.git",
       "state" : {
         "branch" : "main",
         "revision" : "3dbffcfdd329f0882fc39300a95791f9d2285aae"
@@ -13,7 +13,7 @@
     {
       "identity" : "rife-metal",
       "kind" : "remoteSourceControl",
-      "location" : "git@github.com:cinemore/rife-metal.git",
+      "location" : "https://github.com/cinemore/rife-metal.git",
       "state" : {
         "branch" : "main",
         "revision" : "728d28e9c0ac963dabda2f5b20210167a63ec06b"

@@ -15,10 +15,7 @@ private enum AboutAppInfo {
 }
 
 private enum AboutLinks {
-    static let privacy = "https://cinemore.com.cn/privacy"
-    static let licenses = "https://cinemore.com.cn/licenses/apple"
-    static let eula = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
-    static let filing = "https://beian.miit.gov.cn/#/Integrated/index"
+    static let repository = "https://github.com/mistriver-lab/GlassMPV"
 }
 
 struct AboutPage: View {
@@ -45,7 +42,7 @@ struct AboutPage: View {
                 headerView
                     .padding(.bottom, 18)
 
-                contactCard
+                infoCard
 
                 Spacer(minLength: 80)
 
@@ -65,7 +62,7 @@ struct AboutPage: View {
 
                 Spacer()
 
-                contactCard
+                infoCard
                 footerLinks
             }
             .padding(.horizontal, 16)
@@ -80,28 +77,29 @@ struct AboutPage: View {
                 .resizable()
                 .scaledToFit()
                 .frame(width: 86, height: 86)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .shadow(color: Color.black.opacity(0.2), radius: 18, y: 8)
                 .padding(.bottom, 8)
 
-            Text("CinePlayer")
+            Text(verbatim: "GlassMPV")
                 .font(.system(size: 24, weight: .semibold))
 
-            Text("版本号: \(AboutAppInfo.version) (\(AboutAppInfo.build))")
+            Text(verbatim: "版本号: \(AboutAppInfo.version) (\(AboutAppInfo.build))")
                 .f13r()
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var contactCard: some View {
-        VStack(spacing: 0) {
+    private var infoCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: "envelope.fill")
+                Image(systemName: "film.stack")
                     .frame(width: 30, height: 30)
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("联系我们")
+                    Text(verbatim: "GlassMPV for iOS")
                         .f13r()
-                    Text("cinemore@cinemore.com.cn")
+                    Text(verbatim: "iOS 高性能本地视频播放器（支持 Anime4K / MetalFX / 光流 / RIFE 补帧）")
                         .f12r()
                         .foregroundStyle(.secondary)
                 }
@@ -120,48 +118,17 @@ struct AboutPage: View {
     }
 
     private var footerLinks: some View {
-        VStack(spacing: 6) {
-            filingButton
-
-            HStack(spacing: 26) {
-                linkButton(title: "第三方许可信息", url: AboutLinks.licenses)
-                linkButton(title: "隐私政策", url: AboutLinks.privacy)
-                linkButton(title: "使用条款(EULA)", url: AboutLinks.eula)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var filingButton: some View {
-        Button {
-            openExternal(AboutLinks.filing)
-        } label: {
-            #if os(iOS)
-                VStack(alignment: .center, spacing: 6) {
-                    Text("Copyright © 2026 Youduohong. All rights reserved.")
-                        .f12r()
-//                    Text("粤ICP备2022030744号-6A")
-//                        .f12r()
-//                        .foregroundStyle(.blue)
-                }
-            #else
-                Text("Copyright © 2026 Youduohong. All rights reserved.")
+        VStack(spacing: 8) {
+            Button {
+                openExternal(AboutLinks.repository)
+            } label: {
+                Text(verbatim: "GitHub 开源仓库：mistriver-lab/GlassMPV")
                     .f12r()
-            #endif
+                    .foregroundStyle(.blue)
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
         }
-        .buttonStyle(.plain)
-        .focusable(false)
-    }
-
-    private func linkButton(title: LocalizedStringKey, url: String) -> some View {
-        Button {
-            openExternal(url)
-        } label: {
-            Text(title)
-                .f12r()
-                .foregroundStyle(.blue)
-        }
-        .buttonStyle(.plain)
     }
 
     private func openExternal(_ urlString: String) {

@@ -1,0 +1,288 @@
+name: Build GlassMPV iOS IPA
+
+on:
+  push:
+    branches: [ glassmpv-ios ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build GlassMPV iOS v1.2.0 (Unsigned IPA)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select newest available Xcode
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          BEST_XCODE=$(python3 -c 'import glob,os,re; c=sorted(glob.glob("/Applications/Xcode*.app")); print(max(c, key=lambda p:(1 if re.findall(r"\d+",os.path.basename(p)) else 0, [int(x) for x in re.findall(r"\d+",os.path.basename(p))], os.path.basename(p))))')
+          echo "Selecting Xcode: $BEST_XCODE"
+          sudo xcode-select -s "$BEST_XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Configure git HTTPS and download v2.0.0 Frameworks.zip
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          curl --fail --location -o Frameworks.zip https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip
+          unzip -q Frameworks.zip
+          if [ ! -d Frameworks ]; then
+            mkdir -p Frameworks
+            mv *.xcframework Frameworks/
+          fi
+          ls -la Frameworks
+          test -d Frameworks/CinePlayerSDK.xcframework
+          test -d Frameworks/CineFFmpeg.xcframework
+
+      - name: Build and run 5-round iOS Simulator smoke test
+        run: |
+          set -euo pipefail
+          mkdir -p sim-smoke-report
+
+          HAS_SIM_SLICE=$(python3 -c '
+          import glob, os, plistlib
+          p = "Frameworks/CinePlayerSDK.xcframework/Info.plist"
+          found = False
+          if os.path.exists(p):
+              with open(p, "rb") as f:
+                  pl = plistlib.load(f)
+              for item in pl.get("AvailableLibraries", []):
+                  if item.get("SupportedPlatformVariant") == "simulator" or "simulator" in item.get("LibraryIdentifier", "").lower():
+                      found = True
+                      break
+          if not found and glob.glob("Frameworks/CinePlayerSDK.xcframework/*simulator*"):
+              found = True
+          print("1" if found else "0")
+          ')
+
+          if [ "$HAS_SIM_SLICE" != "1" ]; then
+            echo "CinePlayerSDK.xcframework has no iOS Simulator slice; skipping simulator smoke test." | tee sim-smoke-report/launch.log sim-smoke-report/process.log
+            echo "::warning::CinePlayerSDK.xcframework has no iOS Simulator slice; skipping simulator smoke test"
+            exit 0
+          fi
+
+          SIM_UDID=$(python3 -c '
+          import json, re, subprocess, sys
+          data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"]))
+          candidates = []
+          for runtime, devs in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              rt_nums = [int(x) for x in re.findall(r"\d+", runtime)]
+              for d in devs:
+                  name = d.get("name", "")
+                  if d.get("isAvailable") and "iPhone" in name:
+                      dev_nums = [int(x) for x in re.findall(r"\d+", name)]
+                      score = (rt_nums, dev_nums, 1 if "Pro" in name else 0, name)
+                      candidates.append((score, d["udid"], name, runtime))
+          candidates.sort(reverse=True)
+          if not candidates:
+              raise SystemExit("No available iPhone simulator found")
+          best = candidates[0]
+          print(f"Selected simulator: {best[2]} ({best[3]}) UDID={best[1]}", file=sys.stderr)
+          print(best[1])
+          ')
+
+          xcodebuild \
+            -project CinePlayer.xcodeproj \
+            -scheme CinePlayer \
+            -configuration Debug \
+            -destination "id=$SIM_UDID" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            build \
+            SYMROOT="$PWD/build-sim"
+
+          xcrun simctl boot "$SIM_UDID" || true
+          xcrun simctl bootstatus "$SIM_UDID" -b
+
+          APP_PATH="build-sim/Debug-iphonesimulator/CinePlayer.app"
+          test -d "$APP_PATH"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
+          echo "Bundle ID: $BUNDLE_ID" | tee sim-smoke-report/launch.log
+
+          xcrun simctl install "$SIM_UDID" "$APP_PATH"
+
+          # Round 1: Cold launch
+          echo "=== Round 1: Cold Launch ===" | tee -a sim-smoke-report/launch.log
+          xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" >> sim-smoke-report/launch.log 2>&1
+          sleep 5
+          xcrun simctl io "$SIM_UDID" screenshot sim-smoke-report/sim-01-launch.png
+          if ! pgrep -f "CinePlayer.app/CinePlayer" >/dev/null 2>&1; then
+            echo "Round 1 failed: CinePlayer process not running!" | tee -a sim-smoke-report/process.log
+            exit 1
+          fi
+          echo "Round 1 alive: $(pgrep -fl 'CinePlayer.app/CinePlayer' || true)" >> sim-smoke-report/process.log
+
+          # Generate 320x240 15fps/15s (225 frames, timescale 600, 40 ticks/frame) H.264 smoke.mp4
+          swift - <<'SWIFT'
+          import AVFoundation
+          import CoreMedia
+          import CoreVideo
+          import Dispatch
+          import Foundation
+
+          let outURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("smoke.mp4")
+          try? FileManager.default.removeItem(at: outURL)
+          let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
+          let settings: [String: Any] = [
+              AVVideoCodecKey: AVVideoCodecType.h264,
+              AVVideoWidthKey: 320,
+              AVVideoHeightKey: 240,
+          ]
+          let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+          let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+              assetWriterInput: input,
+              sourcePixelBufferAttributes: [
+                  kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                  kCVPixelBufferWidthKey as String: 320,
+                  kCVPixelBufferHeightKey as String: 240,
+              ]
+          )
+          writer.add(input)
+          guard writer.startWriting() else {
+              fatalError("AVAssetWriter startWriting failed: \(String(describing: writer.error))")
+          }
+          writer.startSession(atSourceTime: .zero)
+          for frame in 0..<225 {
+              while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
+              var pb: CVPixelBuffer?
+              CVPixelBufferCreate(kCFAllocatorDefault, 320, 240, kCVPixelFormatType_32ARGB, nil, &pb)
+              if let pb {
+                  CVPixelBufferLockBaseAddress(pb, [])
+                  if let base = CVPixelBufferGetBaseAddress(pb) {
+                      let bytes = base.assumingMemoryBound(to: UInt8.self)
+                      let bpr = CVPixelBufferGetBytesPerRow(pb)
+                      for y in 0..<240 {
+                          for x in 0..<320 {
+                              let off = y * bpr + x * 4
+                              bytes[off] = 255
+                              bytes[off + 1] = UInt8((x + frame * 3) % 256)
+                              bytes[off + 2] = UInt8((y + frame * 2) % 256)
+                              bytes[off + 3] = UInt8(((x ^ y) + frame * 5) % 256)
+                          }
+                      }
+                  }
+                  CVPixelBufferUnlockBaseAddress(pb, [])
+                  let pts = CMTime(value: Int64(frame) * 40, timescale: 600)
+                  adaptor.append(pb, withPresentationTime: pts)
+              }
+          }
+          input.markAsFinished()
+          let sem = DispatchSemaphore(value: 0)
+          writer.finishWriting { sem.signal() }
+          sem.wait()
+          guard writer.status == .completed else {
+              fatalError("AVAssetWriter failed: \(String(describing: writer.error))")
+          }
+          print("Generated smoke.mp4 (320x240, 225 frames @ 15fps / 15s, timescale 600) via AVAssetWriter")
+          SWIFT
+
+          DATA_DIR=$(xcrun simctl get_app_container "$SIM_UDID" "$BUNDLE_ID" data)
+          mkdir -p "$DATA_DIR/Documents"
+          cp smoke.mp4 "$DATA_DIR/Documents/smoke.mp4"
+
+          SMOKE_FAILED=0
+          run_smoke_round() {
+            local label="$1"
+            local wait_secs="$2"
+            local shot_name="$3"
+            shift 3
+            echo "=== Smoke Round: $label ===" | tee -a sim-smoke-report/launch.log
+            xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" || true
+            sleep 1
+            xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" "$@" >> sim-smoke-report/launch.log 2>&1
+            sleep "$wait_secs"
+            xcrun simctl io "$SIM_UDID" screenshot "sim-smoke-report/$shot_name"
+            if pgrep -f "CinePlayer.app/CinePlayer" >/dev/null 2>&1; then
+              echo "Round $label alive: $(pgrep -fl 'CinePlayer.app/CinePlayer' || true)" >> sim-smoke-report/process.log
+            else
+              echo "Round $label FAILED: CinePlayer process not running!" | tee -a sim-smoke-report/process.log
+              SMOKE_FAILED=1
+            fi
+          }
+
+          # Round 2: Baseline + HUD
+          run_smoke_round "baseline" 7 "sim-02-open-local-video.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeTag baseline
+
+          # Round 3: Anime4K SR
+          run_smoke_round "anime4k" 7 "sim-03-smoke-sr.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy anime4k -smokeTag anime4k
+
+          # Round 4: RIFE VFI
+          run_smoke_round "rife" 8 "sim-04-smoke-vfi.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy rife -smokeTag rife
+
+          # Round 5: OpticalFlow
+          run_smoke_round "opticalFlow" 8 "sim-04b-smoke-opticalflow.png" -smokeFile smoke.mp4 -smokeHUD YES -smokeStrategy opticalFlow -smokeTag opticalFlow
+
+          xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" || true
+          sleep 1
+
+          DATA_DIR=$(xcrun simctl get_app_container "$SIM_UDID" "$BUNDLE_ID" data)
+          echo "=== Container Documents ===" > sim-smoke-report/documents.log
+          ls -la "$DATA_DIR/Documents" >> sim-smoke-report/documents.log 2>&1 || true
+          cp "$DATA_DIR/Documents"/smoke-telemetry-*.json sim-smoke-report/ 2>/dev/null || true
+
+          xcrun simctl spawn "$SIM_UDID" log show --last 5m --style compact --predicate 'process == "CinePlayer"' 2>&1 | tail -n 500 > sim-smoke-report/app.log || true
+
+          {
+            echo "=== simctl launchctl list ==="
+            xcrun simctl spawn "$SIM_UDID" launchctl list | grep -i -E "cineplayer|glassmpv" || true
+            echo "=== DiagnosticReports ==="
+            ls -la ~/Library/Logs/DiagnosticReports/*CinePlayer* ~/Library/Logs/DiagnosticReports/*GlassMPV* 2>/dev/null || true
+          } >> sim-smoke-report/process.log 2>&1
+          cp ~/Library/Logs/DiagnosticReports/*CinePlayer* sim-smoke-report/ 2>/dev/null || true
+          cp ~/Library/Logs/DiagnosticReports/*GlassMPV* sim-smoke-report/ 2>/dev/null || true
+
+          if [ "$SMOKE_FAILED" -ne 0 ]; then
+            echo "One or more simulator smoke rounds failed!" >&2
+            exit 1
+          fi
+
+      - name: Upload Simulator smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassMPV-sim-smoke-report
+          path: sim-smoke-report
+          retention-days: 30
+
+      - name: Build unsigned Release iOS app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CinePlayer.xcodeproj \
+            -scheme CinePlayer \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            SYMROOT="$PWD/build"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R build/Release-iphoneos/CinePlayer.app Payload/
+          ls -la Payload/CinePlayer.app/Frameworks || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/CinePlayer.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Payload/CinePlayer.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" Payload/CinePlayer.app/Info.plist
+          IPA_NAME="GlassMPV-v1.2.0-b${{ github.run_number }}-unsigned.ipa"
+          zip -qry "$IPA_NAME" Payload
+          ls -lh "$IPA_NAME"
+
+      - name: Upload GlassMPV-unsigned-ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassMPV-unsigned-ipa
+          path: GlassMPV-v1.2.0-b*-unsigned.ipa
+          retention-days: 30

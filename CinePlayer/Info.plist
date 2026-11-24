@@ -81,28 +81,23 @@
 			<key>CFBundleURLIconFile</key>
 			<string></string>
 			<key>CFBundleURLName</key>
-			<string>cn.com.cinemore.cineplayer</string>
+			<string>com.glassmpv.cine</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>cineplayer</string>
-			</array>
-		</dict>
-		<dict>
-			<key>CFBundleTypeRole</key>
-			<string>Editor</string>
-			<key>CFBundleURLName</key>
-			<string>Top Shelf / 深链接</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
+				<string>glassmpv</string>
 				<string>cineplayer</string>
 			</array>
 		</dict>
 	</array>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用于从系统相册选择本地视频进行播放</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
@@ -116,6 +111,8 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIImageRespectsSafeAreaInsets</key>

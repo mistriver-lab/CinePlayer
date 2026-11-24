@@ -7,6 +7,7 @@ final class PlayerSessionStore: ObservableObject {
     static let shared = PlayerSessionStore()
 
     @Published var currentSource: PlayerSource?
+    @Published var lastOpenError: String?
     @Published var controlConfig: PlayerControlConfig
 
     private var securityScopedURLs: [URL] = []
@@ -48,11 +49,15 @@ final class PlayerSessionStore: ObservableObject {
     }
 
     func open(sources: [PlayerSource], startAt: Int = 0) {
+        lastOpenError = nil
         releaseSecurityScopedURLs()
 
         let preparedSources = prepareSourcesForPlayback(sources)
         guard !preparedSources.isEmpty else {
             close()
+            if let first = sources.first {
+                lastOpenError = "无法读取视频文件：\(first.url.lastPathComponent)"
+            }
             return
         }
 
@@ -77,25 +82,43 @@ final class PlayerSessionStore: ObservableObject {
             }
 
             let hasSecurityAccess = fileURL.startAccessingSecurityScopedResource()
-            let isReadable =
-                FileManager.default.fileExists(atPath: fileURL.path)
-                    && FileManager.default.isReadableFile(atPath: fileURL.path)
+            var resolvedURL = fileURL
+            var isReadable =
+                FileManager.default.fileExists(atPath: resolvedURL.path)
+                    && FileManager.default.isReadableFile(atPath: resolvedURL.path)
 
-            guard isReadable else {
-                if hasSecurityAccess {
-                    fileURL.stopAccessingSecurityScopedResource()
-                }
+            if !isReadable {
+                resolvedURL = Self.coordinateReadableURL(fileURL)
+                isReadable =
+                    FileManager.default.fileExists(atPath: resolvedURL.path)
+                        && FileManager.default.isReadableFile(atPath: resolvedURL.path)
+            }
+
+            guard hasSecurityAccess || isReadable else {
                 continue
             }
 
             if hasSecurityAccess {
                 secured.append(fileURL)
             }
-            result.append(source)
+            let effectiveSource =
+                resolvedURL == fileURL
+                    ? source
+                    : PlayerSource(url: resolvedURL, startTime: source.startTime)
+            result.append(effectiveSource)
         }
 
         securityScopedURLs = secured
         return result
+    }
+
+    nonisolated private static func coordinateReadableURL(_ url: URL) -> URL {
+        var resolvedURL = url
+        var coordError: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
+            resolvedURL = newURL
+        }
+        return resolvedURL
     }
 
     private func releaseSecurityScopedURLs() {

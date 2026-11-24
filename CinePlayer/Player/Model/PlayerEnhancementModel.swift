@@ -4,16 +4,307 @@ import SwiftUI
 import Combine
 
 #if !os(tvOS)
+import CinePlayerSDK
+import CoreVideo
 import Metal
-#if os(macOS)
+import os
 import RifeMetal
-#endif
 #if canImport(MetalFX)
 @preconcurrency import MetalFX
 #endif
 #if !targetEnvironment(simulator)
 @preconcurrency import VideoToolbox
 #endif
+
+nonisolated struct EnhancementLiveStats: Sendable, Equatable, Codable {
+    var strategy: String
+    var detail: String
+    var inputWidth: Int
+    var inputHeight: Int
+    var outputWidth: Int
+    var outputHeight: Int
+    var inputFrames: Int
+    var outputFrames: Int
+    var passthroughFrames: Int
+    var replacedFrames: Int
+    var bypassEvents: Int
+    var timeoutEvents: Int
+    var errorEvents: Int
+    var measuredInputFPS: Double
+    var measuredOutputFPS: Double
+    var avgFrameTimeMs: Double
+    var lastFrameTimeMs: Double
+
+    var isActive: Bool {
+        replacedFrames > 0
+    }
+
+    static let idle = EnhancementLiveStats(
+        strategy: "off",
+        detail: "",
+        inputWidth: 0,
+        inputHeight: 0,
+        outputWidth: 0,
+        outputHeight: 0,
+        inputFrames: 0,
+        outputFrames: 0,
+        passthroughFrames: 0,
+        replacedFrames: 0,
+        bypassEvents: 0,
+        timeoutEvents: 0,
+        errorEvents: 0,
+        measuredInputFPS: 0,
+        measuredOutputFPS: 0,
+        avgFrameTimeMs: 0,
+        lastFrameTimeMs: 0
+    )
+}
+
+nonisolated final class EnhancementTelemetryCollector: @unchecked Sendable {
+    static let shared = EnhancementTelemetryCollector()
+
+    private let lock = NSLock()
+    private let logger = Logger(subsystem: "com.glassmpv.cine", category: "EnhancementTelemetry")
+    private var stats: EnhancementLiveStats = .idle
+    private var totalFrameTimeMs: Double = 0
+    private var lastPublishUptimeNs: UInt64 = 0
+    private var windowStartUptimeNs: UInt64 = 0
+    private var windowInputFrames: Int = 0
+    private var windowOutputFrames: Int = 0
+    private var lastInputFPS: Double = 0
+    private var lastOutputFPS: Double = 0
+
+    private init() {}
+
+    func reset(strategy: String, detail: String) {
+        lock.lock()
+        var fresh = EnhancementLiveStats.idle
+        fresh.strategy = strategy
+        fresh.detail = detail
+        stats = fresh
+        totalFrameTimeMs = 0
+        lastPublishUptimeNs = 0
+        windowStartUptimeNs = 0
+        windowInputFrames = 0
+        windowOutputFrames = 0
+        lastInputFPS = 0
+        lastOutputFPS = 0
+        let snapshot = stats
+        lock.unlock()
+
+        publish(snapshot)
+    }
+
+    func recordFrame(
+        inputWidth: Int,
+        inputHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        emittedCount: Int,
+        didReplace: Bool,
+        elapsedMs: Double
+    ) {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+
+        lock.lock()
+        stats.inputWidth = inputWidth
+        stats.inputHeight = inputHeight
+        stats.outputWidth = outputWidth
+        stats.outputHeight = outputHeight
+        stats.inputFrames += 1
+        stats.outputFrames += emittedCount
+        if didReplace {
+            stats.replacedFrames += 1
+        } else if emittedCount > 0 {
+            stats.passthroughFrames += 1
+        }
+        stats.lastFrameTimeMs = elapsedMs
+        totalFrameTimeMs += elapsedMs
+        stats.avgFrameTimeMs = totalFrameTimeMs / Double(max(1, stats.inputFrames))
+
+        if windowStartUptimeNs == 0 {
+            windowStartUptimeNs = nowNs
+        }
+        windowInputFrames += 1
+        windowOutputFrames += emittedCount
+        let windowElapsedSec = Double(nowNs - windowStartUptimeNs) / 1_000_000_000.0
+        if windowElapsedSec >= 0.5 {
+            lastInputFPS = Double(windowInputFrames) / windowElapsedSec
+            lastOutputFPS = Double(windowOutputFrames) / windowElapsedSec
+            if windowElapsedSec >= 2.0 {
+                windowStartUptimeNs = nowNs
+                windowInputFrames = 0
+                windowOutputFrames = 0
+            }
+        }
+        stats.measuredInputFPS = lastInputFPS
+        stats.measuredOutputFPS = lastOutputFPS
+
+        let shouldPublish = lastPublishUptimeNs == 0 || (nowNs - lastPublishUptimeNs) >= 400_000_000
+        let snapshot: EnhancementLiveStats?
+        if shouldPublish {
+            lastPublishUptimeNs = nowNs
+            snapshot = stats
+        } else {
+            snapshot = nil
+        }
+        lock.unlock()
+
+        if let snapshot {
+            publish(snapshot)
+        }
+    }
+
+    func recordEvent(_ event: FrameCallbackEvent) {
+        lock.lock()
+        switch event {
+        case .callbackTimeout:
+            stats.timeoutEvents += 1
+        case .callbackInvalidResult, .callbackError:
+            stats.errorEvents += 1
+        case .bypassStarted:
+            stats.bypassEvents += 1
+        case .bypassEnded, .warmupReady:
+            break
+        @unknown default:
+            break
+        }
+        let snapshot = stats
+        lastPublishUptimeNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+
+        publish(snapshot)
+    }
+
+    func flush() {
+        lock.lock()
+        let snapshot = stats
+        lastPublishUptimeNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+
+        publish(snapshot)
+    }
+
+    private func publish(_ snapshot: EnhancementLiveStats) {
+        Task { @MainActor in
+            PlayerEnhancementModel.shared.liveStats = snapshot
+        }
+
+        let inFPS = String(format: "%.1f", snapshot.measuredInputFPS)
+        let outFPS = String(format: "%.1f", snapshot.measuredOutputFPS)
+        let avgMs = String(format: "%.2f", snapshot.avgFrameTimeMs)
+        logger.notice(
+            "[EnhancementStats] strategy=\(snapshot.strategy, privacy: .public) detail=\(snapshot.detail, privacy: .public) in=\(snapshot.inputWidth)x\(snapshot.inputHeight) out=\(snapshot.outputWidth)x\(snapshot.outputHeight) inFPS=\(inFPS, privacy: .public) outFPS=\(outFPS, privacy: .public) avgMs=\(avgMs, privacy: .public) inFrames=\(snapshot.inputFrames) outFrames=\(snapshot.outputFrames) replaced=\(snapshot.replacedFrames) passthrough=\(snapshot.passthroughFrames) bypass=\(snapshot.bypassEvents)"
+        )
+
+        #if DEBUG
+        if let tag = UserDefaults.standard.string(forKey: "smokeTag"),
+           !tag.isEmpty,
+           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        {
+            let safeTag = tag.replacingOccurrences(of: "/", with: "_")
+            let fileURL = docs.appendingPathComponent("smoke-telemetry-\(safeTag).json")
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: fileURL, options: .atomic)
+            }
+        }
+        #endif
+    }
+}
+
+nonisolated final class InstrumentedVideoFrameProcessor: VideoFrameProcessor, @unchecked Sendable {
+    private let inner: any VideoFrameProcessor
+    private let collector: EnhancementTelemetryCollector
+
+    init(
+        inner: any VideoFrameProcessor,
+        collector: EnhancementTelemetryCollector = .shared
+    ) {
+        self.inner = inner
+        self.collector = collector
+    }
+
+    func onFrame(_ ctx: VideoFrameContext) -> VideoFrameResult {
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let result = inner.onFrame(ctx)
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+
+        let inW = CVPixelBufferGetWidth(ctx.pixelBuffer)
+        let inH = CVPixelBufferGetHeight(ctx.pixelBuffer)
+
+        switch result {
+        case .passthrough:
+            collector.recordFrame(
+                inputWidth: inW,
+                inputHeight: inH,
+                outputWidth: inW,
+                outputHeight: inH,
+                emittedCount: 1,
+                didReplace: false,
+                elapsedMs: elapsedMs
+            )
+        case let .replace(pb):
+            let outW = CVPixelBufferGetWidth(pb)
+            let outH = CVPixelBufferGetHeight(pb)
+            collector.recordFrame(
+                inputWidth: inW,
+                inputHeight: inH,
+                outputWidth: outW,
+                outputHeight: outH,
+                emittedCount: 1,
+                didReplace: pb !== ctx.pixelBuffer,
+                elapsedMs: elapsedMs
+            )
+        case let .replaceMany(frames):
+            let firstPB = frames.first?.pixelBuffer
+            let outW = firstPB.map { CVPixelBufferGetWidth($0) } ?? inW
+            let outH = firstPB.map { CVPixelBufferGetHeight($0) } ?? inH
+            let didReplace = frames.count > 1
+                || (firstPB.map {
+                    CVPixelBufferGetWidth($0) != inW || CVPixelBufferGetHeight($0) != inH
+                } ?? false)
+            collector.recordFrame(
+                inputWidth: inW,
+                inputHeight: inH,
+                outputWidth: outW,
+                outputHeight: outH,
+                emittedCount: frames.count,
+                didReplace: didReplace,
+                elapsedMs: elapsedMs
+            )
+        @unknown default:
+            collector.recordFrame(
+                inputWidth: inW,
+                inputHeight: inH,
+                outputWidth: inW,
+                outputHeight: inH,
+                emittedCount: 1,
+                didReplace: false,
+                elapsedMs: elapsedMs
+            )
+        }
+
+        return result
+    }
+
+    func onInvalidate(newGeneration: Int64) {
+        inner.onInvalidate(newGeneration: newGeneration)
+        collector.flush()
+    }
+
+    func drainPendingFrames() -> [GeneratedVideoFrame] {
+        inner.drainPendingFrames()
+    }
+
+    func onDrain() {
+        inner.onDrain()
+        collector.flush()
+    }
+
+    var hasPendingFrames: Bool {
+        inner.hasPendingFrames
+    }
+}
 
 nonisolated enum VideoEnhancementStrategy: String, CaseIterable, Identifiable {
     case off
@@ -150,6 +441,7 @@ final class PlayerEnhancementModel: ObservableObject {
     @Published var opticalFlowSectionVisible: Bool = false
     @Published var metalFXSectionVisible: Bool = false
     @Published var rifeSectionVisible: Bool = false
+    @Published var liveStats: EnhancementLiveStats = .idle
     @Published var rifeTierPreference: RifeTierPreference = .auto {
         didSet {
             UserDefaults.standard.set(
@@ -447,6 +739,8 @@ final class PlayerEnhancementModel: ObservableObject {
         metalFXABCompare = false
 
         videoEnhancementStrategy = .off
+        liveStats = .idle
+        EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "")
     }
 
     static let anime4KMaxInputPixels: Int = 1920 * 1080
@@ -724,7 +1018,6 @@ final class PlayerEnhancementModel: ObservableObject {
         ) ?? .resolution2K
     }
 
-    #if os(macOS)
     /// Initial tier picked from current video resolution. The adapter may downgrade
     /// at runtime if measured inference time exceeds the source-fps budget; the
     /// active tier is reflected in `currentRifeTier` (published by the adapter
@@ -732,15 +1025,26 @@ final class PlayerEnhancementModel: ObservableObject {
     var rifeAutoTier: RifeQualityTier {
         guard let w = systemMLCurrentVideoWidth,
               let h = systemMLCurrentVideoHeight else {
+            #if os(iOS)
+            return .fast
+            #else
             return .balanced
+            #endif
         }
         let pixels = w * h
+        #if os(iOS)
+        // Conservative initial picks for iOS real-time playback; runtime adaptive
+        // downgrade remains active if inference exceeds source-fps budget.
+        if pixels <= 1280 * 720 { return .balanced }
+        else { return .fast }
+        #else
         // Conservative initial picks calibrated for 30 fps real-time on M-series
         // Mac. The adapter's runtime downgrade catches devices/content where these
         // are still too aggressive (e.g., M1 base, 60 fps source).
         if pixels <= 1280 * 720 { return .hq }
         else if pixels <= 2560 * 1440 { return .balanced }
         else { return .fast }
+        #endif
     }
 
     /// Tier currently in use by the adapter. In `.auto` preference mode this
@@ -775,6 +1079,5 @@ final class PlayerEnhancementModel: ObservableObject {
         case .fast: return "Fast"
         }
     }
-    #endif
 }
 #endif

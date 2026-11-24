@@ -3,7 +3,7 @@ import CinePlayerSDK
 import Combine
 import Foundation
 import SwiftUI
-#if os(macOS)
+#if !os(tvOS)
 import RifeMetal
 #endif
 
@@ -76,9 +76,7 @@ final class VideoPlayerModel: ObservableObject {
             #endif
             MetalFXSuperResolutionAdapter.shared.endSession()
             OpticalFlowFrameInterpolationAdapter.shared.endSession()
-            #if os(macOS)
-                RifeFrameInterpolationAdapter.shared.endSession()
-            #endif
+            RifeFrameInterpolationAdapter.shared.endSession()
             PlayerEnhancementModel.shared.resetVideoEnhancementForNewVideoSession()
         #endif
 
@@ -160,6 +158,7 @@ final class VideoPlayerModel: ObservableObject {
             switch strategy {
             case .off:
                 logFrameCallbackConfigurationOnce("Video enhancement disabled")
+                EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "")
                 Anime4KHostBridge.reset()
                 #if !targetEnvironment(simulator)
                     if #available(iOS 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0, *) {
@@ -168,9 +167,7 @@ final class VideoPlayerModel: ObservableObject {
                 #endif
                 MetalFXSuperResolutionAdapter.shared.endSession()
                 OpticalFlowFrameInterpolationAdapter.shared.endSession()
-                #if os(macOS)
-                    RifeFrameInterpolationAdapter.shared.endSession()
-                #endif
+                RifeFrameInterpolationAdapter.shared.endSession()
                 return (policy, nil)
 
             case .anime4k:
@@ -181,9 +178,7 @@ final class VideoPlayerModel: ObservableObject {
                 #endif
                 MetalFXSuperResolutionAdapter.shared.endSession()
                 OpticalFlowFrameInterpolationAdapter.shared.endSession()
-                #if os(macOS)
-                    RifeFrameInterpolationAdapter.shared.endSession()
-                #endif
+                RifeFrameInterpolationAdapter.shared.endSession()
 
                 let anime4kEnabled = enhancementModel.anime4kEnabled
                 let preset = enhancementModel.anime4kPreset
@@ -191,6 +186,7 @@ final class VideoPlayerModel: ObservableObject {
                 let resolution = enhancementModel.anime4kOutputResolution
                 guard anime4kEnabled else {
                     logFrameCallbackConfigurationOnce("Anime4K frame callback disabled")
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "")
                     Anime4KHostBridge.reset()
                     return (policy, nil)
                 }
@@ -213,19 +209,26 @@ final class VideoPlayerModel: ObservableObject {
                     logFrameCallbackConfigurationOnce(
                         "Anime4K unavailable: \(error.localizedDescription)"
                     )
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "init-failed")
                     return (policy, nil)
                 }
+                EnhancementTelemetryCollector.shared.reset(
+                    strategy: "anime4k",
+                    detail: "\(preset)-\(resolution.rawValue)"
+                )
                 policy = FrameCallbackPolicy(
                     enabled: true,
                     mode: .asyncSingle(
                         .init(
                             processorFactory: {
-                                Anime4KSingleFrameProcessor(
-                                    interpolator: interpolator,
-                                    preset: preset,
-                                    abCompareEnabled: abCompareEnabled,
-                                    maxOutputWidth: maxOutputWidth,
-                                    maxOutputHeight: maxOutputHeight
+                                InstrumentedVideoFrameProcessor(
+                                    inner: Anime4KSingleFrameProcessor(
+                                        interpolator: interpolator,
+                                        preset: preset,
+                                        abCompareEnabled: abCompareEnabled,
+                                        maxOutputWidth: maxOutputWidth,
+                                        maxOutputHeight: maxOutputHeight
+                                    )
                                 )
                             }
                         )
@@ -240,6 +243,7 @@ final class VideoPlayerModel: ObservableObject {
             case .systemML:
                 #if targetEnvironment(simulator)
                     logFrameCallbackConfigurationOnce("System VT unavailable on simulator")
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "sim-unsupported")
                     return (policy, nil)
                 #else
                     guard #available(iOS 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0, *) else {
@@ -257,9 +261,7 @@ final class VideoPlayerModel: ObservableObject {
                     }
                     MetalFXSuperResolutionAdapter.shared.endSession()
                     OpticalFlowFrameInterpolationAdapter.shared.endSession()
-                    #if os(macOS)
-                        RifeFrameInterpolationAdapter.shared.endSession()
-                    #endif
+                    RifeFrameInterpolationAdapter.shared.endSession()
 
                     let adapter = SystemVideoEnhancementAdapter.shared
                     let frameInterpolationEnabled =
@@ -271,6 +273,7 @@ final class VideoPlayerModel: ObservableObject {
                     guard frameInterpolationEnabled || superResolutionEnabled else {
                         logFrameCallbackConfigurationOnce(
                             "System VT disabled: no active VT feature")
+                        EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "")
                         return (policy, nil)
                     }
 
@@ -282,14 +285,20 @@ final class VideoPlayerModel: ObservableObject {
                         logFrameCallbackConfigurationOnce(
                             "System VT frame interpolation enabled mode=temporal scalar=\(scalar) numFrames=\(numFrames)"
                         )
+                        EnhancementTelemetryCollector.shared.reset(
+                            strategy: "systemML-fi",
+                            detail: "+\(numFrames)f"
+                        )
                         policy = FrameCallbackPolicy(
                             enabled: true,
                             mode: .temporal(
                                 .init(
                                     processorFactory: {
-                                        adapter.makeTemporalProcessor(
-                                            scalar: scalar,
-                                            numFrames: numFrames
+                                        InstrumentedVideoFrameProcessor(
+                                            inner: adapter.makeTemporalProcessor(
+                                                scalar: scalar,
+                                                numFrames: numFrames
+                                            )
                                         )
                                     },
                                     warmup: { dims in
@@ -310,15 +319,21 @@ final class VideoPlayerModel: ObservableObject {
                     logFrameCallbackConfigurationOnce(
                         "System VT super resolution enabled mode=asyncSingle scale=\(scale) abCompare=\(abCompareEnabled)"
                     )
+                    EnhancementTelemetryCollector.shared.reset(
+                        strategy: "systemML-sr",
+                        detail: String(format: "%.2fx", scale)
+                    )
                     policy = FrameCallbackPolicy(
                         enabled: true,
                         mode: .asyncSingle(
                             .init(
                                 processorFactory: {
-                                    SystemVideoEnhancementSuperResolutionProcessor(
-                                        adapter: adapter,
-                                        scale: scale,
-                                        abCompareEnabled: abCompareEnabled
+                                    InstrumentedVideoFrameProcessor(
+                                        inner: SystemVideoEnhancementSuperResolutionProcessor(
+                                            adapter: adapter,
+                                            scale: scale,
+                                            abCompareEnabled: abCompareEnabled
+                                        )
                                     )
                                 },
                                 preset: .aggressive
@@ -330,24 +345,29 @@ final class VideoPlayerModel: ObservableObject {
 
             case .opticalFlow:
                 MetalFXSuperResolutionAdapter.shared.endSession()
-                #if os(macOS)
-                    RifeFrameInterpolationAdapter.shared.endSession()
-                #endif
+                RifeFrameInterpolationAdapter.shared.endSession()
                 guard enhancementModel.opticalFlowSectionVisible else {
                     logFrameCallbackConfigurationOnce(
                         "Optical flow not available: video not 1080p or below"
                     )
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "out-of-range")
                     return (policy, nil)
                 }
                 logFrameCallbackConfigurationOnce(
                     "Optical flow frame callback enabled mode=temporal")
+                EnhancementTelemetryCollector.shared.reset(
+                    strategy: "opticalFlow",
+                    detail: "2x"
+                )
                 let adapter = OpticalFlowFrameInterpolationAdapter.shared
                 policy = FrameCallbackPolicy(
                     enabled: true,
                     mode: .temporal(
                         .init(
                             processorFactory: {
-                                adapter.makeTemporalProcessor()
+                                InstrumentedVideoFrameProcessor(
+                                    inner: adapter.makeTemporalProcessor()
+                                )
                             },
                             warmup: { dims in
                                 await adapter.warmup(dimensions: dims)
@@ -359,48 +379,53 @@ final class VideoPlayerModel: ObservableObject {
                 return (policy, onEvent)
 
             case .rife:
-                #if os(macOS)
-                    Anime4KHostBridge.reset()
-                    #if !targetEnvironment(simulator)
-                        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-                            SystemVideoEnhancementAdapter.shared.endSession()
-                        }
-                    #endif
-                    MetalFXSuperResolutionAdapter.shared.endSession()
-                    OpticalFlowFrameInterpolationAdapter.shared.endSession()
-
-                    guard enhancementModel.rifeSectionVisible else {
-                        logFrameCallbackConfigurationOnce(
-                            "RIFE not available: video out of supported range")
-                        return (policy, nil)
+                Anime4KHostBridge.reset()
+                #if !targetEnvironment(simulator)
+                    if #available(iOS 26.0, macOS 26.0, tvOS 26.0, visionOS 26.0, *) {
+                        SystemVideoEnhancementAdapter.shared.endSession()
                     }
+                #endif
+                MetalFXSuperResolutionAdapter.shared.endSession()
+                OpticalFlowFrameInterpolationAdapter.shared.endSession()
 
-                    let adapter = RifeFrameInterpolationAdapter.shared
-                    let tier = enhancementModel.resolvedRifeTier
-                    let adaptive = enhancementModel.rifeAdaptiveEnabled
-                    enhancementModel.currentRifeTier = tier
-                    adapter.setAdaptiveDowngradeEnabled(adaptive)
-                    adapter.onTierChanged = { newTier in
-                        Task { @MainActor in
-                            PlayerEnhancementModel.shared.currentRifeTier = newTier
-                        }
-                    }
+                guard enhancementModel.rifeSectionVisible else {
                     logFrameCallbackConfigurationOnce(
-                        "RIFE frame callback enabled mode=temporal tier=\(tier.rawValue) adaptive=\(adaptive)")
-                    policy = FrameCallbackPolicy(
-                        enabled: true,
-                        mode: .temporal(
-                            .init(
-                                processorFactory: { adapter.makeTemporalProcessor(tier: tier) },
-                                warmup: { dims in await adapter.warmup(dimensions: dims, tier: tier) }
-                            )
+                        "RIFE not available: video out of supported range")
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "out-of-range")
+                    return (policy, nil)
+                }
+
+                let adapter = RifeFrameInterpolationAdapter.shared
+                let tier = enhancementModel.resolvedRifeTier
+                let adaptive = enhancementModel.rifeAdaptiveEnabled
+                enhancementModel.currentRifeTier = tier
+                adapter.setAdaptiveDowngradeEnabled(adaptive)
+                adapter.onTierChanged = { newTier in
+                    Task { @MainActor in
+                        PlayerEnhancementModel.shared.currentRifeTier = newTier
+                    }
+                }
+                logFrameCallbackConfigurationOnce(
+                    "RIFE frame callback enabled mode=temporal tier=\(tier.rawValue) adaptive=\(adaptive)")
+                EnhancementTelemetryCollector.shared.reset(
+                    strategy: "rife",
+                    detail: tier.rawValue
+                )
+                policy = FrameCallbackPolicy(
+                    enabled: true,
+                    mode: .temporal(
+                        .init(
+                            processorFactory: {
+                                InstrumentedVideoFrameProcessor(
+                                    inner: adapter.makeTemporalProcessor(tier: tier)
+                                )
+                            },
+                            warmup: { dims in await adapter.warmup(dimensions: dims, tier: tier) }
                         )
                     )
-                    let onEvent = makeFrameCallbackEventLogger(tag: "VFI-RIFE")
-                    return (policy, onEvent)
-                #else
-                    return (policy, nil)
-                #endif
+                )
+                let onEvent = makeFrameCallbackEventLogger(tag: "VFI-RIFE")
+                return (policy, onEvent)
 
             case .metalFX:
                 Anime4KHostBridge.reset()
@@ -410,36 +435,43 @@ final class VideoPlayerModel: ObservableObject {
                     }
                 #endif
                 OpticalFlowFrameInterpolationAdapter.shared.endSession()
-                #if os(macOS)
-                    RifeFrameInterpolationAdapter.shared.endSession()
-                #endif
+                RifeFrameInterpolationAdapter.shared.endSession()
                 guard enhancementModel.metalFXSectionVisible else {
                     logFrameCallbackConfigurationOnce(
                         "MetalFX super resolution unavailable for current video"
                     )
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "out-of-range")
                     return (policy, nil)
                 }
                 guard enhancementModel.metalFXSuperResolutionSupported else {
                     logFrameCallbackConfigurationOnce("MetalFX super resolution unsupported on device")
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "unsupported")
                     return (policy, nil)
                 }
                 guard enhancementModel.metalFXSuperResolutionEnabled else {
                     logFrameCallbackConfigurationOnce("MetalFX super resolution disabled")
+                    EnhancementTelemetryCollector.shared.reset(strategy: "off", detail: "")
                     return (policy, nil)
                 }
 
                 let outputResolution = enhancementModel.metalFXOutputResolution
                 let abCompareEnabled = enhancementModel.metalFXABCompare
                 let adapter = MetalFXSuperResolutionAdapter.shared
+                EnhancementTelemetryCollector.shared.reset(
+                    strategy: "metalFX",
+                    detail: outputResolution.rawValue
+                )
                 policy = FrameCallbackPolicy(
                     enabled: true,
                     mode: .asyncSingle(
                         .init(
                             processorFactory: {
-                                MetalFXSuperResolutionProcessor(
-                                    adapter: adapter,
-                                    targetOutputResolution: outputResolution,
-                                    abCompareEnabled: abCompareEnabled
+                                InstrumentedVideoFrameProcessor(
+                                    inner: MetalFXSuperResolutionProcessor(
+                                        adapter: adapter,
+                                        targetOutputResolution: outputResolution,
+                                        abCompareEnabled: abCompareEnabled
+                                    )
                                 )
                             },
                             preset: .aggressive
@@ -460,6 +492,7 @@ final class VideoPlayerModel: ObservableObject {
     #if !os(tvOS)
         private func makeFrameCallbackEventLogger(tag: String) -> EventCallback {
             { event in
+                EnhancementTelemetryCollector.shared.recordEvent(event)
                 switch event {
                 case let .callbackTimeout(kind, elapsedMs):
                     cinemoreLog(

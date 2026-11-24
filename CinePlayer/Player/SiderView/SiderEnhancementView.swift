@@ -14,7 +14,44 @@ struct SiderEnhancementView: View {
                 .padding()
 
             Form {
-                #if os(macOS)
+                Section(header: Text("实时状态")) {
+                    let stats = enhancementModel.liveStats
+                    HStack {
+                        Text("当前策略")
+                        Spacer()
+                        Text(stats.detail.isEmpty ? stats.strategy : "\(stats.strategy) (\(stats.detail))")
+                            .foregroundStyle(stats.isActive ? .green : .secondary)
+                    }
+                    HStack {
+                        Text("分辨率变换")
+                        Spacer()
+                        if stats.inputWidth > 0, stats.outputWidth > 0 {
+                            Text("\(stats.inputWidth)×\(stats.inputHeight) → \(stats.outputWidth)×\(stats.outputHeight)")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("--")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack {
+                        Text("实测帧率 / 耗时")
+                        Spacer()
+                        Text(String(
+                            format: "%.1f → %.1f fps · %.2f ms",
+                            stats.measuredInputFPS,
+                            stats.measuredOutputFPS,
+                            stats.avgFrameTimeMs
+                        ))
+                        .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("已增强 / 旁路")
+                        Spacer()
+                        Text("\(stats.replacedFrames) / \(stats.passthroughFrames) (bypass \(stats.bypassEvents))")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section(
                     header: Text("RIFE 补帧"),
                     footer: Text("Apple 原生 ML 补帧，按分辨率自动选档（4K 以内，仅 SDR）。与光流补帧互斥，不同场景各有所长。")
@@ -60,7 +97,6 @@ struct SiderEnhancementView: View {
                         }
                     }
                 }
-                #endif
 
                 Section(
                     header: Text("Anime4K 超分"),

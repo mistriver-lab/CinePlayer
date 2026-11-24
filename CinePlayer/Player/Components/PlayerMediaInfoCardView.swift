@@ -526,3 +526,89 @@ struct PlayerMediaInfoCardView: View {
         }
     }
 }
+
+#if !os(tvOS)
+struct PlayerStatsHUDView: View {
+    @EnvironmentObject private var playerCoordinator: CinePlayer.Coordinator
+    @ObservedObject private var enhancementModel = PlayerEnhancementModel.shared
+
+    private var videoTrack: FFmpegStreamAsset? {
+        playerCoordinator.controller?.videoTracks.first(where: { $0.isEnabled })
+            ?? playerCoordinator.controller?.videoTrack
+    }
+
+    private var stats: EnhancementLiveStats {
+        enhancementModel.liveStats
+    }
+
+    private var sourceResText: String {
+        if let track = videoTrack, track.naturalSize.width > 0 {
+            return "\(Int(track.naturalSize.width))×\(Int(track.naturalSize.height))"
+        }
+        if stats.inputWidth > 0 {
+            return "\(stats.inputWidth)×\(stats.inputHeight)"
+        }
+        return "--"
+    }
+
+    private var activeResText: String {
+        if stats.inputWidth > 0, stats.outputWidth > 0 {
+            return "\(stats.inputWidth)×\(stats.inputHeight) → \(stats.outputWidth)×\(stats.outputHeight)"
+        }
+        return sourceResText
+    }
+
+    private var strategyText: String {
+        if stats.detail.isEmpty {
+            return stats.strategy
+        }
+        return "\(stats.strategy) (\(stats.detail))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(stats.isActive ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                Text("GlassMPV Stats HUD")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+            }
+
+            Group {
+                if let track = videoTrack {
+                    Text("Codec: \(track.codecName)  \(track.bitDepth)bit  \(track.dynamicRange.description)")
+                    Text(String(format: "Source: %@ @ %.2f fps", sourceResText, track.nominalFrameRate))
+                } else {
+                    Text("Source: \(sourceResText)")
+                }
+
+                Text("Enhance: \(strategyText)")
+                    .foregroundColor(stats.isActive ? .cyan : .white.opacity(0.85))
+                Text("Frames: \(activeResText)")
+                Text(String(
+                    format: "FPS: %.1f → %.1f  |  %.2f ms/f",
+                    stats.measuredInputFPS,
+                    stats.measuredOutputFPS,
+                    stats.avgFrameTimeMs
+                ))
+                Text("Replaced: \(stats.replacedFrames)  Pass: \(stats.passthroughFrames)  Bypass: \(stats.bypassEvents)")
+            }
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundColor(.white.opacity(0.92))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.black.opacity(0.72))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+        )
+        .allowsHitTesting(false)
+    }
+}
+#endif

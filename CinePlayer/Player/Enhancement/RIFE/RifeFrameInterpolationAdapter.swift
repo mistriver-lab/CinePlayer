@@ -1,4 +1,4 @@
-#if !os(tvOS) && os(macOS)
+#if !os(tvOS)
 import CinePlayerSDK
 import CoreMedia
 import CoreVideo

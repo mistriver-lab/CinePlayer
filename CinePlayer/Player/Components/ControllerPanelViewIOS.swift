@@ -205,6 +205,19 @@ struct ControllerPanelViewIOS: View {
 
     private var settingsButtonGroup: some View {
         HStack(spacing: 8) {
+            Button {
+                playerControlModel.showStatsHUD.toggle()
+            } label: {
+                Image(systemName: "chart.bar.xaxis")
+                    .brightness(0.2)
+                    .foregroundColor(playerControlModel.showStatsHUD ? .cyan : .white)
+                    .font(.system(size: 20, weight: .regular))
+                    .frame(width: 44, height: 44)
+                    .background(Color.clear)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
             groupIconButton(icon: "info.circle") {
                 playerMaskModel.hideMask()
                 playerControlModel.hideContainer()

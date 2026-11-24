@@ -12,6 +12,7 @@ final class PlayerControlModel: ObservableObject {
     @Published var showSettingContainer = false
     @Published var showEnhancementContainer = false
     @Published var showMediaInfoCard = false
+    @Published var showStatsHUD = false
     @Published var localSubtitleItems: [LocalSubtitleItem] = []
     @Published var currentSubtitlePath = ""
 

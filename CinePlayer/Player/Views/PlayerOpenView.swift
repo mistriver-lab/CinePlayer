@@ -7,6 +7,10 @@ import UniformTypeIdentifiers
 #else
     import UIKit
 #endif
+#if os(iOS)
+    import CoreTransferable
+    import PhotosUI
+#endif
 
 struct PlayerOpenView: View {
     private enum OpenRoute: Hashable {
@@ -17,6 +21,12 @@ struct PlayerOpenView: View {
 
     @State private var navigationPath: [OpenRoute] = []
     @State private var showFileImporter = false
+    #if os(iOS)
+        @State private var pendingPickedURL: URL?
+        @State private var selectedPhotoItem: PhotosPickerItem?
+        @State private var isImportingPhoto = false
+        @State private var openErrorMessage: String?
+    #endif
     @State private var urlInput = ""
     @State private var isDropTargeted = false
     @FocusState private var isURLFieldFocused: Bool
@@ -111,15 +121,54 @@ struct PlayerOpenView: View {
             isTargeted: $isDropTargeted,
             perform: handleDrop(providers:)
         )
+        #if os(iOS)
+        .sheet(isPresented: $showFileImporter, onDismiss: handlePendingPickedFile) {
+            IOSDocumentPickerView(
+                onPick: { pickedURL in
+                    schedulePickedFileOpen(pickedURL)
+                },
+                onCancel: {
+                    showFileImporter = false
+                },
+                onError: { message in
+                    openErrorMessage = message
+                    showFileImporter = false
+                }
+            )
+            .ignoresSafeArea()
+        }
+        .compatibleOnChange(of: selectedPhotoItem) { newItem in
+            guard let newItem else { return }
+            selectedPhotoItem = nil
+            importFromPhotosItem(newItem)
+        }
+        .alert(
+            "无法打开视频",
+            isPresented: Binding(
+                get: { activeOpenErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        openErrorMessage = nil
+                        sessionStore.lastOpenError = nil
+                    }
+                }
+            )
+        ) {
+            Button("确定", role: .cancel) {}
+        } message: {
+            Text(activeOpenErrorMessage ?? "")
+        }
+        #else
         .fileImporter(
             isPresented: $showFileImporter,
-            allowedContentTypes: [.movie, .video],
+            allowedContentTypes: [.movie, .video, .audiovisualContent, .data],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
                 openMedia(url: url)
             }
         }
+        #endif
         #endif
     }
 
@@ -164,11 +213,17 @@ struct PlayerOpenView: View {
     }
 
     private var topBranding: some View {
-        Image("CinePlayerIcon")
-            .resizable()
-            .scaledToFit()
-            .frame(width: brandingSize, height: brandingSize)
-            .shadow(color: Color.black.opacity(0.2), radius: 18, y: 8)
+        VStack(spacing: 12) {
+            Image("CinePlayerIcon")
+                .resizable()
+                .scaledToFit()
+                .frame(width: brandingSize, height: brandingSize)
+                .clipShape(RoundedRectangle(cornerRadius: brandingSize * 0.22, style: .continuous))
+                .shadow(color: Color.black.opacity(0.2), radius: 18, y: 8)
+
+            Text(verbatim: "GlassMPV")
+                .font(.system(size: 24, weight: .bold))
+        }
     }
 
     private var openControls: some View {
@@ -293,25 +348,44 @@ struct PlayerOpenView: View {
     }
 
     private var openFileButton: some View {
-        Button(action: {
-            showFileImporter = true
-        }) {
-            ZStack {
-                Color.blue
-                Text("打开文件")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-            .frame(width: 240, height: 44)
-            .modifier(
-                GlassEffectModifier(
-                    cornerRadius: Self.openControlCornerRadius,
-                    useCapsule: true,
-                    clipsContent: true
+        VStack(spacing: 12) {
+            Button(action: {
+                showFileImporter = true
+            }) {
+                ZStack {
+                    Color.blue
+                    Text(verbatim: "打开本地文件")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 240, height: 44)
+                .modifier(
+                    GlassEffectModifier(
+                        cornerRadius: Self.openControlCornerRadius,
+                        useCapsule: true,
+                        clipsContent: true
+                    )
                 )
-            )
+            }
+            .buttonStyle(.plain)
+
+            #if os(iOS)
+                let importingPhoto = isImportingPhoto
+                let controlCornerRadius = Self.openControlCornerRadius
+                PhotosPicker(
+                    selection: $selectedPhotoItem,
+                    matching: .videos,
+                    preferredItemEncoding: .current
+                ) {
+                    PhotosPickerLabelView(
+                        isImporting: importingPhoto,
+                        cornerRadius: controlCornerRadius
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(isImportingPhoto)
+            #endif
         }
-        .buttonStyle(.plain)
     }
 
     private var bottomHint: some View {
@@ -381,6 +455,59 @@ struct PlayerOpenView: View {
         }
     #endif
 
+    #if os(iOS)
+        private var activeOpenErrorMessage: String? {
+            openErrorMessage ?? sessionStore.lastOpenError
+        }
+
+        private func schedulePickedFileOpen(_ pickedURL: URL) {
+            pendingPickedURL = pickedURL
+            let wasPresenting = showFileImporter
+            showFileImporter = false
+            if !wasPresenting {
+                handlePendingPickedFile()
+            } else {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    handlePendingPickedFile()
+                }
+            }
+        }
+
+        private func handlePendingPickedFile() {
+            guard let pickedURL = pendingPickedURL else { return }
+            pendingPickedURL = nil
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(150))
+                do {
+                    let stagedURL = try stageGlassMPVImportedFile(from: pickedURL)
+                    openMedia(url: stagedURL)
+                } catch {
+                    openErrorMessage = "无法读取本地视频：\(error.localizedDescription)"
+                }
+            }
+        }
+
+        private func importFromPhotosItem(_ item: PhotosPickerItem) {
+            guard !isImportingPhoto else { return }
+            isImportingPhoto = true
+            openErrorMessage = nil
+            Task { @MainActor in
+                defer { isImportingPhoto = false }
+                do {
+                    guard let movie = try await item.loadTransferable(type: GlassMPVMovieTransferable.self) else {
+                        openErrorMessage = "未能从系统相册读取该视频（请确认 iCloud 原片已下载到本地）。"
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(150))
+                    openMedia(url: movie.url)
+                } catch {
+                    openErrorMessage = "相册视频导入失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    #endif
+
     private func openMedia(url: URL) {
         #if os(tvOS)
             isURLFieldFocused = false
@@ -406,3 +533,235 @@ struct PlayerOpenView: View {
         return URL(string: text)
     }
 }
+
+#if os(iOS)
+private struct PhotosPickerLabelView: View {
+    let isImporting: Bool
+    let cornerRadius: CGFloat
+
+    nonisolated init(isImporting: Bool, cornerRadius: CGFloat) {
+        self.isImporting = isImporting
+        self.cornerRadius = cornerRadius
+    }
+
+    var body: some View {
+        ZStack {
+            Color.indigo
+            if isImporting {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("正在导入相册视频…")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            } else {
+                Label("从相册选择", systemImage: "photo.on.rectangle.angled")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+        }
+        .frame(width: 240, height: 44)
+        .modifier(
+            GlassEffectModifier(
+                cornerRadius: cornerRadius,
+                useCapsule: true,
+                clipsContent: true
+            )
+        )
+    }
+}
+
+nonisolated private var glassMPVImportsDirectory: URL {
+    FileManager.default.temporaryDirectory.appendingPathComponent("GlassMPVImports", isDirectory: true)
+}
+
+nonisolated private func sanitizeGlassMPVFilename(_ raw: String) -> String {
+    let disallowed = CharacterSet(charactersIn: "/\\:#?%\"<>|*")
+    let joined = raw.components(separatedBy: disallowed).filter { !$0.isEmpty }.joined(separator: "_")
+    let trimmed = joined.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "video" : String(trimmed.prefix(80))
+}
+
+nonisolated private func pruneGlassMPVImports(keepingLatest limit: Int) {
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+        at: glassMPVImportsDirectory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+    ), entries.count > limit else {
+        return
+    }
+    let sorted = entries.sorted { lhs, rhs in
+        let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return lDate > rDate
+    }
+    for obsolete in sorted.dropFirst(limit) {
+        try? FileManager.default.removeItem(at: obsolete)
+    }
+}
+
+nonisolated private func stageGlassMPVImportedFile(from sourceURL: URL) throws -> URL {
+    let standardizedImports = glassMPVImportsDirectory.standardizedFileURL.path
+    if sourceURL.standardizedFileURL.path.hasPrefix(standardizedImports),
+       FileManager.default.isReadableFile(atPath: sourceURL.path) {
+        return sourceURL
+    }
+
+    try FileManager.default.createDirectory(at: glassMPVImportsDirectory, withIntermediateDirectories: true)
+    pruneGlassMPVImports(keepingLatest: 3)
+
+    let didAccess = sourceURL.startAccessingSecurityScopedResource()
+    defer {
+        if didAccess {
+            sourceURL.stopAccessingSecurityScopedResource()
+        }
+    }
+
+    let ext = sourceURL.pathExtension
+    let rawBase = sourceURL.deletingPathExtension().lastPathComponent
+    let sanitizedBase = sanitizeGlassMPVFilename(rawBase)
+    let prefix = String(UUID().uuidString.prefix(8))
+    let filename = ext.isEmpty ? "\(prefix)_\(sanitizedBase)" : "\(prefix)_\(sanitizedBase).\(ext)"
+    let destURL = glassMPVImportsDirectory.appendingPathComponent(filename)
+
+    if FileManager.default.fileExists(atPath: destURL.path) {
+        try FileManager.default.removeItem(at: destURL)
+    }
+
+    var didDirectCopy = false
+    var directCopyError: Error?
+    if FileManager.default.isReadableFile(atPath: sourceURL.path) {
+        do {
+            try FileManager.default.copyItem(at: sourceURL, to: destURL)
+            didDirectCopy = FileManager.default.isReadableFile(atPath: destURL.path)
+        } catch {
+            directCopyError = error
+        }
+    }
+
+    if !didDirectCopy {
+        if FileManager.default.fileExists(atPath: destURL.path) {
+            try? FileManager.default.removeItem(at: destURL)
+        }
+        var coordinatorError: NSError?
+        var copyError: Error?
+        NSFileCoordinator().coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
+            do {
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.copyItem(at: readableURL, to: destURL)
+            } catch {
+                copyError = error
+            }
+        }
+        if let coordinatorError {
+            throw coordinatorError
+        }
+        if let copyError {
+            throw copyError
+        }
+        if !FileManager.default.isReadableFile(atPath: destURL.path), let directCopyError {
+            throw directCopyError
+        }
+    }
+
+    guard FileManager.default.isReadableFile(atPath: destURL.path) else {
+        throw NSError(
+            domain: "GlassMPV.LocalImport",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "导入后的视频副本不可读：\(destURL.lastPathComponent)"]
+        )
+    }
+    return destURL
+}
+
+private struct IOSDocumentPickerView: UIViewControllerRepresentable {
+    let onPick: (URL) -> Void
+    let onCancel: () -> Void
+    let onError: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick, onCancel: onCancel, onError: onError)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: [.movie, .video, .audiovisualContent, .data],
+            asCopy: true
+        )
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
+        context.coordinator.onPick = onPick
+        context.coordinator.onCancel = onCancel
+        context.coordinator.onError = onError
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        var onPick: (URL) -> Void
+        var onCancel: () -> Void
+        var onError: (String) -> Void
+
+        init(
+            onPick: @escaping (URL) -> Void,
+            onCancel: @escaping (URL) -> Void,
+            onError: @escaping (String) -> Void
+        ) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+            self.onError = onError
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let firstURL = urls.first else {
+                onError("未获取到所选视频文件。")
+                return
+            }
+            do {
+                let stagedURL = try stageGlassMPVImportedFile(from: firstURL)
+                onPick(stagedURL)
+            } catch {
+                onError("无法读取所选文件：\(error.localizedDescription)")
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onCancel()
+        }
+    }
+}
+
+nonisolated private struct GlassMPVMovieTransferable: Transferable, Sendable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let stagedURL = try stageGlassMPVImportedFile(from: received.file)
+            return GlassMPVMovieTransferable(url: stagedURL)
+        }
+
+        FileRepresentation(contentType: .video) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let stagedURL = try stageGlassMPVImportedFile(from: received.file)
+            return GlassMPVMovieTransferable(url: stagedURL)
+        }
+
+        FileRepresentation(contentType: .audiovisualContent) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let stagedURL = try stageGlassMPVImportedFile(from: received.file)
+            return GlassMPVMovieTransferable(url: stagedURL)
+        }
+    }
+}
+#endif
