@@ -39,7 +39,7 @@ jobs:
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           python3 -c '
-          import pathlib
+          import pathlib, plistlib
           for p in [
             pathlib.Path("CinePlayer.xcodeproj/project.pbxproj"),
             pathlib.Path("CinePlayer.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"),
@@ -59,6 +59,93 @@ jobs:
             encoding="utf-8",
           )
           print("Patched currentRifeTier in", pem)
+
+          pov = pathlib.Path("CinePlayer/Player/Views/PlayerOpenView.swift")
+          ps = pov.read_text(encoding="utf-8")
+          t_ut = "            allowedContentTypes: [.movie, .video],"
+          assert ps.count(t_ut) == 1, f"unexpected allowedContentTypes count: {ps.count(t_ut)}"
+          ps = ps.replace(t_ut, "            allowedContentTypes: [.item],", 1)
+          t_cb = "            if case .success(let urls) = result, let url = urls.first {\n                openMedia(url: url)\n            }"
+          assert ps.count(t_cb) == 1, f"unexpected fileImporter callback count: {ps.count(t_cb)}"
+          r_cb = "            if case .success(let urls) = result, let url = urls.first {\n                Task { @MainActor in\n                    try? await Task.sleep(for: .milliseconds(450))\n                    openMedia(url: url)\n                }\n            }"
+          ps = ps.replace(t_cb, r_cb, 1)
+          pov.write_text(ps, encoding="utf-8")
+          print("Patched PlayerOpenView.swift")
+
+          pss = pathlib.Path("CinePlayer/Player/Model/PlayerSessionStore.swift")
+          ss = pss.read_text(encoding="utf-8")
+          t_sec = "\n".join([
+            "            let hasSecurityAccess = fileURL.startAccessingSecurityScopedResource()",
+            "            let isReadable =",
+            "                FileManager.default.fileExists(atPath: fileURL.path)",
+            "                    && FileManager.default.isReadableFile(atPath: fileURL.path)",
+            "",
+            "            guard isReadable else {",
+            "                if hasSecurityAccess {",
+            "                    fileURL.stopAccessingSecurityScopedResource()",
+            "                }",
+            "                continue",
+            "            }",
+            "",
+            "            if hasSecurityAccess {",
+            "                secured.append(fileURL)",
+            "            }",
+            "            result.append(source)",
+          ])
+          assert ss.count(t_sec) == 1, f"unexpected PlayerSessionStore block count: {ss.count(t_sec)}"
+          r_sec = "\n".join([
+            "            let hasSecurityAccess = fileURL.startAccessingSecurityScopedResource()",
+            "            var resolvedURL = fileURL",
+            "            var isReadable =",
+            "                FileManager.default.fileExists(atPath: resolvedURL.path)",
+            "                    && FileManager.default.isReadableFile(atPath: resolvedURL.path)",
+            "",
+            "            if !isReadable {",
+            "                resolvedURL = Self.coordinateReadableURL(fileURL)",
+            "                isReadable =",
+            "                    FileManager.default.fileExists(atPath: resolvedURL.path)",
+            "                        && FileManager.default.isReadableFile(atPath: resolvedURL.path)",
+            "            }",
+            "",
+            "            guard hasSecurityAccess || isReadable else {",
+            "                continue",
+            "            }",
+            "",
+            "            if hasSecurityAccess {",
+            "                secured.append(fileURL)",
+            "            }",
+            "            let effectiveSource =",
+            "                resolvedURL == fileURL",
+            "                    ? source",
+            "                    : PlayerSource(url: resolvedURL, startTime: source.startTime)",
+            "            result.append(effectiveSource)",
+          ])
+          ss = ss.replace(t_sec, r_sec, 1)
+          t_end = "    private func releaseSecurityScopedURLs() {"
+          assert ss.count(t_end) == 1, f"unexpected releaseSecurityScopedURLs count: {ss.count(t_end)}"
+          r_end = "\n".join([
+            "    nonisolated private static func coordinateReadableURL(_ url: URL) -> URL {",
+            "        var resolvedURL = url",
+            "        var coordError: NSError?",
+            "        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in",
+            "            resolvedURL = newURL",
+            "        }",
+            "        return resolvedURL",
+            "    }",
+            "",
+            "    private func releaseSecurityScopedURLs() {",
+          ])
+          ss = ss.replace(t_end, r_end, 1)
+          pss.write_text(ss, encoding="utf-8")
+          print("Patched PlayerSessionStore.swift")
+
+          ip = pathlib.Path("CinePlayer/Info.plist")
+          with ip.open("rb") as f:
+            pl = plistlib.load(f)
+          pl["UIFileSharingEnabled"] = True
+          with ip.open("wb") as f:
+            plistlib.dump(pl, f)
+          print("Patched Info.plist UIFileSharingEnabled=True")
           '
 
       - name: Resolve Swift Package dependencies
