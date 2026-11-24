@@ -146,6 +146,41 @@ jobs:
           with ip.open("wb") as f:
             plistlib.dump(pl, f)
           print("Patched Info.plist UIFileSharingEnabled=True")
+          app_path = pathlib.Path("CinePlayer/CinePlayerApp.swift")
+          app_txt = app_path.read_text(encoding="utf-8")
+          t_app = "\n".join([
+            "            #else",
+            "                .onOpenURL { url in",
+            "                    if url.isFileURL {",
+            "                        sessionStore.open(url: url)",
+            "                    }",
+            "                }",
+            "            #endif",
+          ])
+          assert app_txt.count(t_app) == 1, f"unexpected CinePlayerApp.swift block count: {app_txt.count(t_app)}"
+          r_app = "\n".join([
+            "            #else",
+            "                .onOpenURL { url in",
+            "                    if url.isFileURL {",
+            "                        sessionStore.open(url: url)",
+            "                    }",
+            "                    #if DEBUG",
+            "                    else if url.scheme == \"cineplayer\",",
+            "                            url.host(percentEncoded: false) == \"smoke\",",
+            "                            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),",
+            "                            let name = components.queryItems?.first(where: { $0.name == \"file\" })?.value,",
+            "                            !name.isEmpty,",
+            "                            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first",
+            "                    {",
+            "                        let targetURL = docs.appendingPathComponent((name as NSString).lastPathComponent)",
+            "                        sessionStore.open(url: targetURL)",
+            "                    }",
+            "                    #endif",
+            "                }",
+            "            #endif",
+          ])
+          app_path.write_text(app_txt.replace(t_app, r_app, 1), encoding="utf-8")
+          print("Patched CinePlayerApp.swift DEBUG cineplayer://smoke hook")
           '
 
       - name: Resolve Swift Package dependencies
@@ -232,7 +267,7 @@ jobs:
           xcrun simctl io "$SIM_UDID" screenshot sim-smoke-report/sim-01-launch.png
 
           if command -v ffmpeg >/dev/null 2>&1; then
-            ffmpeg -y -f lavfi -i testsrc=size=320x240:rate=30 -t 2 -c:v libx264 -pix_fmt yuv420p smoke.mp4
+            ffmpeg -y -f lavfi -i testsrc=size=320x240:rate=30 -t 10 -c:v libx264 -pix_fmt yuv420p smoke.mp4
           else
             swift - <<'SWIFT'
           import AVFoundation
@@ -261,7 +296,7 @@ jobs:
           writer.add(input)
           writer.startWriting()
           writer.startSession(atSourceTime: .zero)
-          for frame in 0..<60 {
+          for frame in 0..<150 {
               while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
               var pb: CVPixelBuffer?
               CVPixelBufferCreate(kCFAllocatorDefault, 320, 240, kCVPixelFormatType_32ARGB, nil, &pb)
@@ -281,7 +316,7 @@ jobs:
                       }
                   }
                   CVPixelBufferUnlockBaseAddress(pb, [])
-                  adaptor.append(pb, withPresentationTime: CMTime(value: Int64(frame), timescale: 30))
+                  adaptor.append(pb, withPresentationTime: CMTime(value: Int64(frame), timescale: 15))
               }
           }
           input.markAsFinished()
@@ -298,11 +333,11 @@ jobs:
           DATA_DIR=$(xcrun simctl get_app_container "$SIM_UDID" "$BUNDLE_ID" data)
           mkdir -p "$DATA_DIR/Documents"
           cp smoke.mp4 "$DATA_DIR/Documents/smoke.mp4"
-          SMOKE_URI=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$DATA_DIR/Documents/smoke.mp4")
-
-          xcrun simctl openurl "$SIM_UDID" "$SMOKE_URI" > sim-smoke-report/openurl.log 2>&1 || true
-          sleep 6
+          xcrun simctl openurl "$SIM_UDID" "cineplayer://smoke?file=smoke.mp4" > sim-smoke-report/openurl.log 2>&1
+          sleep 4
           xcrun simctl io "$SIM_UDID" screenshot sim-smoke-report/sim-02-open-local-video.png
+
+          xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact --predicate 'process == "CinePlayer"' 2>&1 | tail -n 200 > sim-smoke-report/app.log || true
 
           {
             echo "=== simctl launchctl list ==="
