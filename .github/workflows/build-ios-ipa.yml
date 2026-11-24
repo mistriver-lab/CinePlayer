@@ -35,7 +35,7 @@ jobs:
           ls -la Frameworks
           test -d Frameworks/CinePlayerSDK.xcframework
 
-      - name: Rewrite SSH SPM URLs to HTTPS
+      - name: Patch v1.0.1 iOS build compatibility
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           python3 -c '
@@ -50,6 +50,15 @@ jobs:
               if new != txt:
                 p.write_text(new, encoding="utf-8")
                 print("Rewrote SSH URLs in", p)
+          pem = pathlib.Path("CinePlayer/Player/Model/PlayerEnhancementModel.swift")
+          s = pem.read_text(encoding="utf-8")
+          target = "        currentRifeTier = nil"
+          assert s.count(target) == 1, f"unexpected count: {s.count(target)}"
+          pem.write_text(
+            s.replace(target, "        #if os(macOS)\n        currentRifeTier = nil\n        #endif", 1),
+            encoding="utf-8",
+          )
+          print("Patched currentRifeTier in", pem)
           '
 
       - name: Resolve Swift Package dependencies
