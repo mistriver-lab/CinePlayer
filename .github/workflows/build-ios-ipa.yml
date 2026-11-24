@@ -106,8 +106,7 @@ jobs:
                   .sheet(isPresented: $showFileImporter, onDismiss: handlePendingPickedFile) {
                       IOSDocumentPickerView(
                           onPick: { pickedURL in
-                              pendingPickedURL = pickedURL
-                              showFileImporter = false
+                              schedulePickedFileOpen(pickedURL)
                           },
                           onCancel: {
                               showFileImporter = false
@@ -198,30 +197,16 @@ jobs:
                       .buttonStyle(.plain)
 
                       #if os(iOS)
-                          PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
-                              ZStack {
-                                  Color.indigo
-                                  if isImportingPhoto {
-                                      HStack(spacing: 8) {
-                                          ProgressView()
-                                              .tint(.white)
-                                          Text("正在导入相册视频…")
-                                              .font(.system(size: 15, weight: .semibold))
-                                              .foregroundStyle(.white)
-                                      }
-                                  } else {
-                                      Label("从相册选择", systemImage: "photo.on.rectangle.angled")
-                                          .font(.system(size: 15, weight: .semibold))
-                                          .foregroundStyle(.white)
-                                  }
-                              }
-                              .frame(width: 240, height: 44)
-                              .modifier(
-                                  GlassEffectModifier(
-                                      cornerRadius: Self.openControlCornerRadius,
-                                      useCapsule: true,
-                                      clipsContent: true
-                                  )
+                          let importingPhoto = isImportingPhoto
+                          let controlCornerRadius = Self.openControlCornerRadius
+                          PhotosPicker(
+                              selection: $selectedPhotoItem,
+                              matching: .videos,
+                              preferredItemEncoding: .current
+                          ) {
+                              PhotosPickerLabelView(
+                                  isImporting: importingPhoto,
+                                  cornerRadius: controlCornerRadius
                               )
                           }
                           .buttonStyle(.plain)
@@ -241,6 +226,20 @@ jobs:
           r_open = r"""    #if os(iOS)
                   private var activeOpenErrorMessage: String? {
                       openErrorMessage ?? sessionStore.lastOpenError
+                  }
+
+                  private func schedulePickedFileOpen(_ pickedURL: URL) {
+                      pendingPickedURL = pickedURL
+                      let wasPresenting = showFileImporter
+                      showFileImporter = false
+                      if !wasPresenting {
+                          handlePendingPickedFile()
+                      } else {
+                          Task { @MainActor in
+                              try? await Task.sleep(for: .milliseconds(500))
+                              handlePendingPickedFile()
+                          }
+                      }
                   }
 
                   private func handlePendingPickedFile() {
@@ -288,18 +287,55 @@ jobs:
           ios_helpers = r"""
 
           #if os(iOS)
-          private var cinePlayerImportsDirectory: URL {
+          private struct PhotosPickerLabelView: View {
+              let isImporting: Bool
+              let cornerRadius: CGFloat
+
+              nonisolated init(isImporting: Bool, cornerRadius: CGFloat) {
+                  self.isImporting = isImporting
+                  self.cornerRadius = cornerRadius
+              }
+
+              var body: some View {
+                  ZStack {
+                      Color.indigo
+                      if isImporting {
+                          HStack(spacing: 8) {
+                              ProgressView()
+                                  .tint(.white)
+                              Text("正在导入相册视频…")
+                                  .font(.system(size: 15, weight: .semibold))
+                                  .foregroundStyle(.white)
+                          }
+                      } else {
+                          Label("从相册选择", systemImage: "photo.on.rectangle.angled")
+                              .font(.system(size: 15, weight: .semibold))
+                              .foregroundStyle(.white)
+                      }
+                  }
+                  .frame(width: 240, height: 44)
+                  .modifier(
+                      GlassEffectModifier(
+                          cornerRadius: cornerRadius,
+                          useCapsule: true,
+                          clipsContent: true
+                      )
+                  )
+              }
+          }
+
+          nonisolated private var cinePlayerImportsDirectory: URL {
               FileManager.default.temporaryDirectory.appendingPathComponent("CinePlayerImports", isDirectory: true)
           }
 
-          private func sanitizeCinePlayerFilename(_ raw: String) -> String {
+          nonisolated private func sanitizeCinePlayerFilename(_ raw: String) -> String {
               let disallowed = CharacterSet(charactersIn: "/\\:#?%\"<>|*")
               let joined = raw.components(separatedBy: disallowed).filter { !$0.isEmpty }.joined(separator: "_")
               let trimmed = joined.trimmingCharacters(in: .whitespacesAndNewlines)
               return trimmed.isEmpty ? "video" : String(trimmed.prefix(80))
           }
 
-          private func pruneCinePlayerImports(keepingLatest limit: Int) {
+          nonisolated private func pruneCinePlayerImports(keepingLatest limit: Int) {
               guard let entries = try? FileManager.default.contentsOfDirectory(
                   at: cinePlayerImportsDirectory,
                   includingPropertiesForKeys: [.contentModificationDateKey],
@@ -317,7 +353,7 @@ jobs:
               }
           }
 
-          private func stageCinePlayerImportedFile(from sourceURL: URL) throws -> URL {
+          nonisolated private func stageCinePlayerImportedFile(from sourceURL: URL) throws -> URL {
               let standardizedImports = cinePlayerImportsDirectory.standardizedFileURL.path
               if sourceURL.standardizedFileURL.path.hasPrefix(standardizedImports),
                  FileManager.default.isReadableFile(atPath: sourceURL.path) {
@@ -345,21 +381,44 @@ jobs:
                   try FileManager.default.removeItem(at: destURL)
               }
 
-              var coordinatorError: NSError?
-              var copyError: Error?
-              NSFileCoordinator().coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
+              var didDirectCopy = false
+              var directCopyError: Error?
+              if FileManager.default.isReadableFile(atPath: sourceURL.path) {
                   do {
-                      try FileManager.default.copyItem(at: readableURL, to: destURL)
+                      try FileManager.default.copyItem(at: sourceURL, to: destURL)
+                      didDirectCopy = FileManager.default.isReadableFile(atPath: destURL.path)
                   } catch {
-                      copyError = error
+                      directCopyError = error
                   }
               }
-              if let coordinatorError {
-                  throw coordinatorError
+
+              if !didDirectCopy {
+                  if FileManager.default.fileExists(atPath: destURL.path) {
+                      try? FileManager.default.removeItem(at: destURL)
+                  }
+                  var coordinatorError: NSError?
+                  var copyError: Error?
+                  NSFileCoordinator().coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
+                      do {
+                          if FileManager.default.fileExists(atPath: destURL.path) {
+                              try FileManager.default.removeItem(at: destURL)
+                          }
+                          try FileManager.default.copyItem(at: readableURL, to: destURL)
+                      } catch {
+                          copyError = error
+                      }
+                  }
+                  if let coordinatorError {
+                      throw coordinatorError
+                  }
+                  if let copyError {
+                      throw copyError
+                  }
+                  if !FileManager.default.isReadableFile(atPath: destURL.path), let directCopyError {
+                      throw directCopyError
+                  }
               }
-              if let copyError {
-                  throw copyError
-              }
+
               guard FileManager.default.isReadableFile(atPath: destURL.path) else {
                   throw NSError(
                       domain: "CinePlayer.LocalImport",
@@ -431,7 +490,7 @@ jobs:
               }
           }
 
-          private struct CinePlayerMovieTransferable: Transferable, Sendable {
+          nonisolated private struct CinePlayerMovieTransferable: Transferable, Sendable {
               let url: URL
 
               static var transferRepresentation: some TransferRepresentation {
@@ -443,6 +502,13 @@ jobs:
                   }
 
                   FileRepresentation(contentType: .video) { movie in
+                      SentTransferredFile(movie.url)
+                  } importing: { received in
+                      let stagedURL = try stageCinePlayerImportedFile(from: received.file)
+                      return CinePlayerMovieTransferable(url: stagedURL)
+                  }
+
+                  FileRepresentation(contentType: .audiovisualContent) { movie in
                       SentTransferredFile(movie.url)
                   } importing: { received in
                       let stagedURL = try stageCinePlayerImportedFile(from: received.file)
@@ -556,9 +622,10 @@ jobs:
           with ip.open("rb") as f:
             pl = plistlib.load(f)
           pl["UIFileSharingEnabled"] = True
+          pl["NSPhotoLibraryUsageDescription"] = "用于从系统相册选择本地视频进行播放"
           with ip.open("wb") as f:
             plistlib.dump(pl, f)
-          print("Patched Info.plist UIFileSharingEnabled=True")
+          print("Patched Info.plist UIFileSharingEnabled=True and NSPhotoLibraryUsageDescription")
           app_path = pathlib.Path("CinePlayer/CinePlayerApp.swift")
           app_txt = app_path.read_text(encoding="utf-8")
           if "import Foundation" not in app_txt:
