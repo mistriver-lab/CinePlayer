@@ -711,7 +711,7 @@ private struct IOSDocumentPickerView: UIViewControllerRepresentable {
 
         init(
             onPick: @escaping (URL) -> Void,
-            onCancel: @escaping (URL) -> Void,
+            onCancel: @escaping () -> Void,
             onError: @escaping (String) -> Void
         ) {
             self.onPick = onPick
