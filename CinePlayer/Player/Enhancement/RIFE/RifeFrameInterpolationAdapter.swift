@@ -30,6 +30,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     // Per-resolution pixel buffer pools.
     private var outputPool: CVPixelBufferPool?
     private var outputPoolKey: (Int, Int)?
+    private var workOutputPool: CVPixelBufferPool?
+    private var workOutputPoolKey: (Int, Int)?
     private var bgraConversionPool: CVPixelBufferPool?
     private var bgraConversionPoolKey: (Int, Int)?
     private var pixelTransferSession: VTPixelTransferSession?
@@ -50,26 +52,25 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     private static let perfWindowSize = 12
     private static let switchCooldownFrames = 20
     private static let downgradeBudgetRatio = 0.9 // p90 > 0.9 × budget triggers downgrade
-    private static let overloadPassBudgetRatio = 1.25
-    private static let overloadConsecutiveThreshold = 6
-    private static let overloadCooldownFrames = 30
+    private static let overloadPassBudgetRatio = 1.8
+    private static let overloadConsecutiveThreshold = 8
+    private static let overloadCooldownFrames = 10
+    private static let manualSevereBudgetRatio = 2.0
+    private static let manualSevereConsecutiveThreshold = 6
 
     /// Enable / disable runtime auto-downgrade. Disabled when the user picks an
-    /// explicit tier — their choice is honored even if the device can't keep up.
-    /// Disabling clears any prior auto-downgrade state so the next frame takes
-    /// the caller-provided tier.
+    /// explicit tier — their choice is honored unless severe overload occurs on iOS.
+    /// Clears prior runtime state so the next frame takes the caller-provided tier.
     nonisolated func setAdaptiveDowngradeEnabled(_ enabled: Bool) {
         queue.sync {
             adaptiveDowngradeEnabled = enabled
-            if !enabled {
-                effectiveTier = nil
-                perfSamplesMs.removeAll(keepingCapacity: true)
-                framesSinceLastSwitch = 0
-                consecutiveOverBudgetFrames = 0
-                overloadSkipRemaining = 0
-                lastDiagLogNs = 0
-                lastThermalWarnNs = 0
-            }
+            effectiveTier = nil
+            perfSamplesMs.removeAll(keepingCapacity: true)
+            framesSinceLastSwitch = 0
+            consecutiveOverBudgetFrames = 0
+            overloadSkipRemaining = 0
+            lastDiagLogNs = 0
+            lastThermalWarnNs = 0
         }
     }
 
@@ -85,6 +86,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             streamKey = nil
             outputPool = nil
             outputPoolKey = nil
+            workOutputPool = nil
+            workOutputPoolKey = nil
             bgraConversionPool = nil
             bgraConversionPoolKey = nil
             if let session = pixelTransferSession {
@@ -105,14 +108,51 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
         }
     }
 
+    nonisolated static func workingDimensions(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        tier: RifeQualityTier
+    ) -> (Int, Int) {
+        #if os(iOS)
+        let maxLongEdge: Int
+        switch tier {
+        case .fast: maxLongEdge = 1024
+        case .balanced: maxLongEdge = 1280
+        case .hq: maxLongEdge = 960
+        }
+        let longEdge = max(sourceWidth, sourceHeight)
+        guard longEdge > maxLongEdge, longEdge > 0 else {
+            return (sourceWidth, sourceHeight)
+        }
+        let scale = Double(maxLongEdge) / Double(longEdge)
+        let alignDown32: (Int) -> Int = { raw in
+            max(64, (raw / 32) * 32)
+        }
+        return (
+            alignDown32(Int((Double(sourceWidth) * scale).rounded(.down))),
+            alignDown32(Int((Double(sourceHeight) * scale).rounded(.down)))
+        )
+        #else
+        return (sourceWidth, sourceHeight)
+        #endif
+    }
+
     /// Pre-build the RifeInterpolator and graph for the given dims/tier on a background
     /// thread, so the first frame doesn't pay the build cost.
     nonisolated func warmup(dimensions: CMVideoDimensions, tier: RifeQualityTier) async {
+        let srcW = Int(dimensions.width)
+        let srcH = Int(dimensions.height)
+        guard srcW > 0, srcH > 0 else { return }
+        let (workW, workH) = Self.workingDimensions(
+            sourceWidth: srcW,
+            sourceHeight: srcH,
+            tier: tier
+        )
         await Task.detached(priority: .userInitiated) { [weak self] in
             self?.queue.sync {
                 _ = self?.ensureStreamOnQueue(
-                    width: Int(dimensions.width),
-                    height: Int(dimensions.height),
+                    width: workW,
+                    height: workH,
                     tier: tier
                 )
             }
@@ -158,7 +198,7 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
                     lastThermalWarnNs = nowNs
                     EnhancementTelemetryCollector.shared.recordDowngrade(
-                        reason: "RIFE thermal critical -> passthrough"
+                        reason: "RIFE 设备过热，已切直通"
                     )
                 }
                 stream?.reset()
@@ -188,28 +228,38 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 lastDims = dims
             }
             let activeTier = effectiveTier ?? tier
+            let (workW, workH) = Self.workingDimensions(
+                sourceWidth: width,
+                sourceHeight: height,
+                tier: activeTier
+            )
+            let needsScaling = (workW != width || workH != height)
 
-            guard let stream = ensureStreamOnQueue(width: width, height: height, tier: activeTier) else {
+            guard let stream = ensureStreamOnQueue(width: workW, height: workH, tier: activeTier) else {
                 return .passthrough
             }
 
-            // Stream caches the prev frame internally; we only need curr.
-            guard let currBGRA = pixelBufferAsBGRAOnQueue(current.pixelBuffer, width: width, height: height) else {
+            // Stream caches the prev frame internally; convert and hardware-scale curr in one pass.
+            guard let currBGRA = pixelBufferAsBGRAOnQueue(current.pixelBuffer, width: workW, height: workH) else {
                 cinemoreLog(level: .debug, "[VFI-RIFE] pixelBufferAsBGRA failed")
                 return .passthrough
             }
             let tAfterVT = DispatchTime.now().uptimeNanoseconds
 
-            guard let outBuffer = ensureOutputPool(width: width, height: height) else {
+            guard let inferOutBuffer = needsScaling
+                ? ensureWorkOutputPool(width: workW, height: workH)
+                : ensureOutputPool(width: width, height: height) else {
                 cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool failed")
                 return .passthrough
             }
-            current.pixelBuffer.copyPropagatedAttachments(to: outBuffer)
+            if !needsScaling {
+                current.pixelBuffer.copyPropagatedAttachments(to: inferOutBuffer)
+            }
             let tAfterPool = DispatchTime.now().uptimeNanoseconds
 
             let didWriteMidframe: Bool
             do {
-                didWriteMidframe = try stream.push(currBGRA, into: outBuffer)
+                didWriteMidframe = try stream.push(currBGRA, into: inferOutBuffer)
             } catch {
                 cinemoreLog(level: .debug, "[VFI-RIFE] stream.push failed: \(error)")
                 return .passthrough
@@ -227,12 +277,28 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 ])
             }
 
+            let finalMidBuffer: CVPixelBuffer
+            if needsScaling {
+                guard let fullOutBuffer = ensureOutputPool(width: width, height: height) else {
+                    cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool (upscale) failed")
+                    return .passthrough
+                }
+                current.pixelBuffer.copyPropagatedAttachments(to: fullOutBuffer)
+                guard scaleBufferOnQueue(inferOutBuffer, into: fullOutBuffer) else {
+                    cinemoreLog(level: .debug, "[VFI-RIFE] upscale failed")
+                    return .passthrough
+                }
+                finalMidBuffer = fullOutBuffer
+            } else {
+                finalMidBuffer = inferOutBuffer
+            }
+
             // 两段 duration 严格相加 == segmentDur,否则时间轴错位。
             let firstDuration = segmentDur / 2
             let secondDuration = segmentDur - firstDuration
             let midTs = prevTs + firstDuration
             let generated: [GeneratedVideoFrame] = [
-                GeneratedVideoFrame(pixelBuffer: outBuffer, timestamp: prevTs, duration: firstDuration),
+                GeneratedVideoFrame(pixelBuffer: finalMidBuffer, timestamp: prevTs, duration: firstDuration),
                 GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: midTs, duration: secondDuration),
             ]
             let tEnd = DispatchTime.now().uptimeNanoseconds
@@ -251,7 +317,7 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                     " pool=\(String(format: "%.1f", poolMs))" +
                     " infer=\(String(format: "%.1f", inferMs))" +
                     " post=\(String(format: "%.1f", postMs)))" +
-                    " tier=\(activeTier.rawValue) \(width)x\(height) thermal=\(thermal)"
+                    " tier=\(activeTier.rawValue) src=\(width)x\(height) work=\(workW)x\(workH) thermal=\(thermal)"
                 )
             }
 
@@ -265,12 +331,44 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                         overloadSkipRemaining = Self.overloadCooldownFrames
                         consecutiveOverBudgetFrames = 0
                         EnhancementTelemetryCollector.shared.recordDowngrade(
-                            reason: "RIFE fast over-budget -> cooldown passthrough"
+                            reason: "RIFE 极速档超负荷，短暂直通冷却"
                         )
                     }
                 } else {
                     consecutiveOverBudgetFrames = 0
                 }
+            } else if !adaptiveDowngradeEnabled,
+                      let next = activeTier.downgraded(),
+                      current.fps > 0.5 {
+                #if os(iOS)
+                let budgetMs = 1000.0 / Double(current.fps)
+                if totalMs > budgetMs * Self.manualSevereBudgetRatio {
+                    consecutiveOverBudgetFrames += 1
+                    if consecutiveOverBudgetFrames >= Self.manualSevereConsecutiveThreshold {
+                        let reason = "RIFE \(activeTier.rawValue.uppercased()) 严重超时，自动降档至 \(next.rawValue.uppercased())"
+                        cinemoreLog(
+                            level: .warning,
+                            "[VFI-RIFE] manual severe timeout \(activeTier.rawValue) -> \(next.rawValue) (total=\(String(format: "%.1f", totalMs))ms budget=\(String(format: "%.1f", budgetMs))ms fps=\(current.fps))"
+                        )
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: reason,
+                            detail: next.rawValue
+                        )
+                        effectiveTier = next
+                        consecutiveOverBudgetFrames = 0
+                        framesSinceLastSwitch = 0
+                        perfSamplesMs.removeAll(keepingCapacity: true)
+                        stream = nil
+                        streamKey = nil
+                        let cb = onTierChanged
+                        cb?(next)
+                    }
+                } else {
+                    consecutiveOverBudgetFrames = 0
+                }
+                #else
+                consecutiveOverBudgetFrames = 0
+                #endif
             } else {
                 consecutiveOverBudgetFrames = 0
             }
@@ -315,7 +413,7 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             "[VFI-RIFE] auto-downgrade \(currentTier.rawValue) → \(next.rawValue) (p90=\(String(format: "%.1f", p90))ms budget=\(String(format: "%.1f", budgetMs))ms fps=\(fps))"
         )
         EnhancementTelemetryCollector.shared.recordDowngrade(
-            reason: "RIFE \(currentTier.rawValue) -> \(next.rawValue) (p90=\(String(format: "%.1f", p90))ms)",
+            reason: "RIFE 过载，自动降档 \(currentTier.rawValue.uppercased()) → \(next.rawValue.uppercased())",
             detail: next.rawValue
         )
         effectiveTier = next
@@ -367,10 +465,42 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     }
 
     private func ensureOutputPool(width: Int, height: Int) -> CVPixelBuffer? {
+        acquireBGRAPixelBuffer(
+            pool: &outputPool,
+            poolKey: &outputPoolKey,
+            width: width,
+            height: height
+        )
+    }
+
+    private func ensureWorkOutputPool(width: Int, height: Int) -> CVPixelBuffer? {
+        acquireBGRAPixelBuffer(
+            pool: &workOutputPool,
+            poolKey: &workOutputPoolKey,
+            width: width,
+            height: height
+        )
+    }
+
+    private func ensureBGRAConversionBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        acquireBGRAPixelBuffer(
+            pool: &bgraConversionPool,
+            poolKey: &bgraConversionPoolKey,
+            width: width,
+            height: height
+        )
+    }
+
+    private func acquireBGRAPixelBuffer(
+        pool: inout CVPixelBufferPool?,
+        poolKey: inout (Int, Int)?,
+        width: Int,
+        height: Int
+    ) -> CVPixelBuffer? {
         let key = (width, height)
-        if let existing = outputPoolKey, existing == key, let pool = outputPool {
+        if let existingKey = poolKey, existingKey == key, let existingPool = pool {
             var buf: CVPixelBuffer?
-            guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buf) == kCVReturnSuccess,
+            guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, existingPool, &buf) == kCVReturnSuccess,
                   let buf else { return nil }
             return buf
         }
@@ -381,66 +511,52 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
-        var pool: CVPixelBufferPool?
-        guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess,
-              let pool else { return nil }
-        outputPool = pool
-        outputPoolKey = key
+        var createdPool: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &createdPool) == kCVReturnSuccess,
+              let createdPool else { return nil }
+        pool = createdPool
+        poolKey = key
         var buf: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buf) == kCVReturnSuccess,
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, createdPool, &buf) == kCVReturnSuccess,
               let buf else { return nil }
         return buf
     }
 
-    private func ensureBGRAConversionBuffer(width: Int, height: Int) -> CVPixelBuffer? {
-        let key = (width, height)
-        if let existing = bgraConversionPoolKey, existing == key, let pool = bgraConversionPool {
-            var buf: CVPixelBuffer?
-            guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buf) == kCVReturnSuccess,
-                  let buf else { return nil }
-            return buf
+    private func ensurePixelTransferSession() -> VTPixelTransferSession? {
+        if let existing = pixelTransferSession {
+            return existing
         }
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-        ]
-        var pool: CVPixelBufferPool?
-        guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess,
-              let pool else { return nil }
-        bgraConversionPool = pool
-        bgraConversionPoolKey = key
-        var buf: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buf) == kCVReturnSuccess,
-              let buf else { return nil }
-        return buf
+        var newSession: VTPixelTransferSession?
+        guard VTPixelTransferSessionCreate(
+            allocator: kCFAllocatorDefault,
+            pixelTransferSessionOut: &newSession
+        ) == noErr,
+        let newSession else {
+            return nil
+        }
+        pixelTransferSession = newSession
+        return newSession
+    }
+
+    private func scaleBufferOnQueue(_ source: CVPixelBuffer, into destination: CVPixelBuffer) -> Bool {
+        guard let session = ensurePixelTransferSession() else {
+            return false
+        }
+        return VTPixelTransferSessionTransferImage(session, from: source, to: destination) == noErr
     }
 
     private func pixelBufferAsBGRAOnQueue(_ buffer: CVPixelBuffer,
                                             width: Int,
                                             height: Int) -> CVPixelBuffer? {
-        if CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA {
+        if CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+           CVPixelBufferGetWidth(buffer) == width,
+           CVPixelBufferGetHeight(buffer) == height {
             return buffer
         }
         guard let outRef = ensureBGRAConversionBuffer(width: width, height: height) else {
             return nil
         }
-        if let existing = pixelTransferSession {
-            guard VTPixelTransferSessionTransferImage(existing, from: buffer, to: outRef) == noErr else {
-                return nil
-            }
-            return outRef
-        }
-        var newSession: VTPixelTransferSession?
-        guard VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &newSession) == noErr,
-              let newSession else { return nil }
-        pixelTransferSession = newSession
-        guard VTPixelTransferSessionTransferImage(newSession, from: buffer, to: outRef) == noErr else {
-            return nil
-        }
-        return outRef
+        return scaleBufferOnQueue(buffer, into: outRef) ? outRef : nil
     }
 }
 

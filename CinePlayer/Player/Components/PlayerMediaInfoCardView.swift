@@ -207,16 +207,16 @@ struct PlayerMediaInfoCardView: View {
                         .foregroundColor(.white)
 
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                        infoRow(label: "Profile", value: config.profileString)
+                        infoRow(label: "配置档", value: config.profileString)
                         if !config.codecTag.isEmpty {
                             infoRow(
-                                label: "Codec",
+                                label: "编码",
                                 value: "\(config.codecTag).\(config.profile).\(config.level)"
                             )
                         }
                         if !config.layers.isEmpty {
                             infoRow(
-                                label: "Layers",
+                                label: "图层",
                                 value: "\(config.layers.joined(separator: "+"))"
                             )
                         }
@@ -233,7 +233,7 @@ struct PlayerMediaInfoCardView: View {
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                 infoRow(label: "编码", value: video.codecName)
                 if let profileName = video.profileName, !profileName.isEmpty {
-                    infoRow(label: "Profile", value: profileName)
+                    infoRow(label: "配置档", value: profileName)
                 }
                 infoRow(
                     label: "分辨率",
@@ -315,7 +315,7 @@ struct PlayerMediaInfoCardView: View {
 
                 infoRow(label: "编码", value: audio.codecName)
                 if let profileName = audio.profileName, !profileName.isEmpty {
-                    infoRow(label: "Profile", value: profileName)
+                    infoRow(label: "配置档", value: profileName)
                 }
 
                 if audio.trackDuration > 0 {
@@ -558,11 +558,12 @@ struct PlayerStatsHUDView: View {
         return sourceResText
     }
 
-    private var strategyText: String {
-        if stats.detail.isEmpty {
-            return stats.strategy
-        }
-        return "\(stats.strategy) (\(stats.detail))"
+    private var localizedStrategyText: String {
+        stats.localizedStrategyText
+    }
+
+    private var localizedThermalText: String {
+        stats.localizedThermalText
     }
 
     private var thermalColor: Color {
@@ -581,33 +582,33 @@ struct PlayerStatsHUDView: View {
                 Circle()
                     .fill(stats.isActive ? Color.green : Color.orange)
                     .frame(width: 7, height: 7)
-                Text("GlassMPV Stats HUD")
+                Text("GlassMPV 实时状态")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
             }
 
             Group {
                 if let track = videoTrack {
-                    Text("Codec: \(track.codecName)  \(track.bitDepth)bit  \(track.dynamicRange.description)")
-                    Text(String(format: "Source: %@ @ %.2f fps", sourceResText, track.nominalFrameRate))
+                    Text("编码: \(track.codecName)  \(track.bitDepth)bit  \(track.dynamicRange.description)")
+                    Text(String(format: "片源: %@ @ %.2f fps", sourceResText, track.nominalFrameRate))
                 } else {
-                    Text("Source: \(sourceResText)")
+                    Text("片源: \(sourceResText)")
                 }
 
-                Text("Enhance: \(strategyText)")
+                Text("增强: \(localizedStrategyText)")
                     .foregroundColor(stats.isActive ? .cyan : .white.opacity(0.85))
-                Text("Frames: \(activeResText)")
+                Text("画面: \(activeResText)")
                 Text(String(
-                    format: "FPS: %.1f → %.1f  |  %.2f ms/f",
+                    format: "帧率: %.1f → %.1f  |  %.2f ms/帧",
                     stats.measuredInputFPS,
                     stats.measuredOutputFPS,
                     stats.avgFrameTimeMs
                 ))
-                Text("Replaced: \(stats.replacedFrames)  Pass: \(stats.passthroughFrames)  Bypass: \(stats.bypassEvents)  TO: \(stats.timeoutEvents)")
-                Text("Thermal: \(stats.thermalState)")
+                Text("处理: \(stats.replacedFrames)  直通: \(stats.passthroughFrames)  跳过: \(stats.bypassEvents)  超时: \(stats.timeoutEvents)")
+                Text("温控: \(localizedThermalText)")
                     .foregroundColor(thermalColor)
                 if !stats.downgradeReason.isEmpty {
-                    Text("Guard: \(stats.downgradeReason)")
+                    Text("保护: \(stats.downgradeReason)")
                         .foregroundColor(.orange)
                 }
             }

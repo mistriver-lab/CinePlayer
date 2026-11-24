@@ -41,6 +41,43 @@ nonisolated struct EnhancementLiveStats: Sendable, Equatable, Codable {
         replacedFrames > 0
     }
 
+    var localizedThermalText: String {
+        switch thermalState {
+        case "nominal": "正常"
+        case "fair": "温热"
+        case "serious": "偏热"
+        case "critical": "过热"
+        default: thermalState
+        }
+    }
+
+    var localizedStrategyText: String {
+        let base: String
+        switch strategy {
+        case "off": base = "关闭"
+        case "rife": base = "RIFE 补帧"
+        case "opticalFlow": base = "光流补帧"
+        case "anime4k": base = "Anime4K 超分"
+        case "metalFX": base = "MetalFX 超分"
+        case "systemML-sr", "systemMLSR": base = "系统超分"
+        case "systemML-fi", "systemMLFI": base = "系统补帧"
+        default: base = strategy
+        }
+        guard !detail.isEmpty else { return base }
+        let localizedDetail: String
+        switch detail {
+        case "hq": localizedDetail = "HQ"
+        case "balanced": localizedDetail = "Balanced"
+        case "fast": localizedDetail = "Fast"
+        case "out-of-range": localizedDetail = "超出范围"
+        case "init-failed": localizedDetail = "初始化失败"
+        case "sim-unsupported": localizedDetail = "模拟器不支持"
+        case "unsupported": localizedDetail = "设备不支持"
+        default: localizedDetail = detail
+        }
+        return "\(base) (\(localizedDetail))"
+    }
+
     static let idle = EnhancementLiveStats(
         strategy: "off",
         detail: "",

@@ -47,7 +47,7 @@ struct SiderEnhancementView: View {
                     HStack {
                         Text("当前策略")
                         Spacer()
-                        Text(stats.detail.isEmpty ? stats.strategy : "\(stats.strategy) (\(stats.detail))")
+                        Text(stats.localizedStrategyText)
                             .foregroundStyle(stats.isActive ? .green : .secondary)
                     }
                     HStack {
@@ -75,11 +75,11 @@ struct SiderEnhancementView: View {
                     HStack {
                         Text("已增强 / 旁路")
                         Spacer()
-                        Text("\(stats.replacedFrames) / \(stats.passthroughFrames) (bypass \(stats.bypassEvents))")
+                        Text("\(stats.replacedFrames) / \(stats.passthroughFrames) (跳过 \(stats.bypassEvents))")
                             .foregroundStyle(.secondary)
                     }
                     HStack {
-                        Text("Timeout / Error")
+                        Text("超时 / 错误")
                         Spacer()
                         Text("\(stats.timeoutEvents) / \(stats.errorEvents)")
                             .foregroundStyle((stats.timeoutEvents > 0 || stats.errorEvents > 0) ? .orange : .secondary)
@@ -87,7 +87,7 @@ struct SiderEnhancementView: View {
                     HStack {
                         Text("设备温控")
                         Spacer()
-                        Text(stats.thermalState)
+                        Text(stats.localizedThermalText)
                             .foregroundStyle(thermalStateColor(stats.thermalState))
                     }
                     if !stats.downgradeReason.isEmpty {
@@ -103,7 +103,7 @@ struct SiderEnhancementView: View {
 
                 Section(
                     header: Text("RIFE 补帧"),
-                    footer: Text("Apple 原生 ML 补帧，按分辨率自动选档（4K 以内，仅 SDR）。与光流补帧互斥，不同场景各有所长。")
+                    footer: Text("Apple 原生 ML 补帧（4K 以内，仅 SDR）。iOS 端 4K 片源将自动采用高速工作分辨率推理并硬件放大，超负荷时自动降档保护；与光流补帧互斥。")
                 ) {
                     let isAvailable = enhancementModel.rifeSectionVisible
 

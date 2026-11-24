@@ -344,7 +344,7 @@
                     if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
                         lastThermalWarnNs = nowNs
                         EnhancementTelemetryCollector.shared.recordDowngrade(
-                            reason: "OF thermal critical -> passthrough"
+                            reason: "光流设备过热，已切直通"
                         )
                     }
                     return .passthrough

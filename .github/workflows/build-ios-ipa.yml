@@ -101,6 +101,11 @@ jobs:
 
           APP_PATH="build-sim/Debug-iphonesimulator/CinePlayer.app"
           test -d "$APP_PATH"
+          nm "$APP_PATH/CinePlayer" 2>&1 | grep CTFontDescriptorMatchFontDescriptorsWithProgressHandler || true
+          if nm -u "$APP_PATH/CinePlayer" | grep -F "CTFontDescriptorMatchFontDescriptorsWithProgressHandler" >/dev/null; then
+            echo "ERROR: CTFontDescriptorMatchFontDescriptorsWithProgressHandler is still undefined in simulator binary!" >&2
+            exit 1
+          fi
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
           echo "Bundle ID: $BUNDLE_ID" | tee sim-smoke-report/launch.log
 
@@ -123,6 +128,8 @@ jobs:
               ls -la "$APP_PATH/Frameworks" 2>&1 || true
               echo "=== codesign -dv --entitlements :- ==="
               codesign -dv --entitlements :- "$APP_PATH" 2>&1 || true
+              echo "=== nm CTFontDescriptorMatchFontDescriptorsWithProgressHandler ==="
+              nm "$APP_PATH/CinePlayer" 2>&1 | grep CTFontDescriptorMatchFontDescriptorsWithProgressHandler || true
             } > sim-smoke-report/binary-inspect.log 2>&1 || true
 
             DATA_DIR=$(xcrun simctl get_app_container "$SIM_UDID" "$BUNDLE_ID" data 2>/dev/null || true)
@@ -311,6 +318,11 @@ jobs:
           rm -rf Payload
           mkdir -p Payload
           cp -R build/Release-iphoneos/CinePlayer.app Payload/
+          nm "Payload/CinePlayer.app/CinePlayer" 2>&1 | grep CTFontDescriptorMatchFontDescriptorsWithProgressHandler || true
+          if nm -u "Payload/CinePlayer.app/CinePlayer" | grep -F "CTFontDescriptorMatchFontDescriptorsWithProgressHandler" >/dev/null; then
+            echo "ERROR: CTFontDescriptorMatchFontDescriptorsWithProgressHandler is still undefined in Release IPA binary!" >&2
+            exit 1
+          fi
           ls -la Payload/CinePlayer.app/Frameworks || true
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/CinePlayer.app/Info.plist
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Payload/CinePlayer.app/Info.plist
