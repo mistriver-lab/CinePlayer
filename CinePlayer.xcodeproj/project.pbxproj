@@ -398,7 +398,7 @@
 					"$(inherited)",
 					"-ObjC",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.glassmpv.cine;
+				PRODUCT_BUNDLE_IDENTIFIER = cn.com.cinemore.cineplayer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -472,7 +472,7 @@
 					"$(inherited)",
 					"-ObjC",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.glassmpv.cine;
+				PRODUCT_BUNDLE_IDENTIFIER = cn.com.cinemore.cineplayer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;

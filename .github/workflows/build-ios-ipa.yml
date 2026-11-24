@@ -128,7 +128,7 @@ jobs:
               cp "$DATA_DIR/Documents"/smoke-telemetry-*.json sim-smoke-report/ 2>/dev/null || true
             fi
 
-            xcrun simctl spawn "$SIM_UDID" log show --last 5m --style compact --predicate 'process == "CinePlayer" OR eventMessage CONTAINS[c] "CinePlayer" OR eventMessage CONTAINS[c] "com.glassmpv.cine"' 2>&1 | tail -n 500 > sim-smoke-report/app.log || true
+            xcrun simctl spawn "$SIM_UDID" log show --last 5m --style compact --predicate 'process == "CinePlayer" OR eventMessage CONTAINS[c] "CinePlayer" OR eventMessage CONTAINS[c] "cn.com.cinemore.cineplayer"' 2>&1 | tail -n 500 > sim-smoke-report/app.log || true
 
             {
               echo "=== simctl launchctl list ==="
