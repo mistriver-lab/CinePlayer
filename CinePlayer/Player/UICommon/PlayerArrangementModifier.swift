@@ -7,12 +7,12 @@ extension EnvironmentValues {
 /// 视频和控制层保持同一身份；系统在半折状态下把控制台移入独立区域。
 struct PlayerArrangementModifier<Controls: View>: ViewModifier {
     @ViewBuilder var controls: (Bool) -> Controls
-    #if os(iOS)
+    #if os(iOS) && compiler(>=6.4)
     @State private var hasInteriorDivision = false
     #endif
 
     func body(content: Content) -> some View {
-        #if os(iOS)
+        #if os(iOS) && compiler(>=6.4)
         if #available(iOS 27.1, *) {
             ArrangementView {
                 PlayerArrangementPrimary { separated in
@@ -36,7 +36,7 @@ struct PlayerArrangementModifier<Controls: View>: ViewModifier {
     }
 }
 
-#if os(iOS)
+#if os(iOS) && compiler(>=6.4)
 @available(iOS 27.1, *)
 private struct PlayerArrangementPrimary<Content: View>: View {
     @Environment(\.overlayArrangementZIndex) private var overlayArrangementZIndex
