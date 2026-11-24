@@ -115,13 +115,10 @@ struct SubtitleTracksMenu: View {
 
     private func selectLocalSubtitle(_ item: PlayerControlModel.LocalSubtitleItem) {
         playerControlModel.currentSubtitlePath = item.id
-        let controller = playerCoordinator.controller
-        Task { @MainActor in
-            try? await controller?.loadSubtitleFile(
-                subtitleID: item.displayName,
-                url: item.url
-            )
-        }
+        playerCoordinator.controller?.loadSubtitleFile(
+            subtitleID: item.displayName,
+            url: item.url
+        )
     }
 
     private func clearSubtitle() {

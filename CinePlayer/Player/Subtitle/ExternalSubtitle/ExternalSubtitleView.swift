@@ -176,13 +176,10 @@ struct ExternalSubtitleView: View {
     private func playSubtitle(_ item: PlayerControlModel.LocalSubtitleItem) {
         playerControlModel.currentSubtitlePath = item.id
         subtitleCommandScheduler.schedule {
-            let controller = playerCoordinator.controller
-            Task { @MainActor in
-                try? await controller?.loadSubtitleFile(
-                    subtitleID: item.displayName,
-                    url: item.url
-                )
-            }
+            playerCoordinator.controller?.loadSubtitleFile(
+                subtitleID: item.displayName,
+                url: item.url
+            )
         }
     }
 

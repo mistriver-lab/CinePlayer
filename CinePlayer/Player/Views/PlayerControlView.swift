@@ -1016,9 +1016,7 @@ struct PlayerControlView: View {
             if let item = playerControlModel.localSubtitleItems.first(
                 where: { $0.id == playerControlModel.currentSubtitlePath }
             ) {
-                Task { @MainActor in
-                    try? await controller.loadSubtitleFile(subtitleID: item.displayName, url: item.url)
-                }
+                controller.loadSubtitleFile(subtitleID: item.displayName, url: item.url)
             }
         } else if playerModel.playerCoordinator.subtitleTrackIndex != -1 {
             let selectedIndex = playerModel.playerCoordinator.subtitleTrackIndex

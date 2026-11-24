@@ -22,11 +22,11 @@ jobs:
           sudo xcode-select -s "$BEST_XCODE/Contents/Developer"
           xcodebuild -version
 
-      - name: Configure git HTTPS and download v2.0.0 Frameworks.zip
+      - name: Configure git HTTPS and download v1.0.0 Frameworks.zip
         run: |
           set -euo pipefail
           git config --global url."https://github.com/".insteadOf "git@github.com:"
-          curl --fail --location -o Frameworks.zip https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip
+          curl --fail --location -o Frameworks.zip https://github.com/cinemore/CinePlayer/releases/download/v1.0.0/Frameworks.zip
           unzip -q Frameworks.zip
           if [ ! -d Frameworks ]; then
             mkdir -p Frameworks
