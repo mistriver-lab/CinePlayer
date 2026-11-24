@@ -358,8 +358,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                         consecutiveOverBudgetFrames = 0
                         framesSinceLastSwitch = 0
                         perfSamplesMs.removeAll(keepingCapacity: true)
-                        stream = nil
-                        streamKey = nil
+                        self.stream = nil
+                        self.streamKey = nil
                         let cb = onTierChanged
                         cb?(next)
                     }
