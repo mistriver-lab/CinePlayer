@@ -35,6 +35,23 @@ jobs:
           ls -la Frameworks
           test -d Frameworks/CinePlayerSDK.xcframework
 
+      - name: Rewrite SSH SPM URLs to HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          python3 -c '
+          import pathlib
+          for p in [
+            pathlib.Path("CinePlayer.xcodeproj/project.pbxproj"),
+            pathlib.Path("CinePlayer.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"),
+          ]:
+            if p.exists():
+              txt = p.read_text(encoding="utf-8")
+              new = txt.replace("git@github.com:", "https://github.com/")
+              if new != txt:
+                p.write_text(new, encoding="utf-8")
+                print("Rewrote SSH URLs in", p)
+          '
+
       - name: Resolve Swift Package dependencies
         run: xcodebuild -resolvePackageDependencies -project CinePlayer.xcodeproj -scheme CinePlayer -skipPackagePluginValidation -skipMacroValidation
 
