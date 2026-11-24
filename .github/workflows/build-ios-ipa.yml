@@ -31,7 +31,7 @@ jobs:
           ls -la Frameworks
 
       - name: Resolve Swift Package dependencies
-        run: xcodebuild -resolvePackageDependencies -project CinePlayer.xcodeproj -scheme CinePlayer
+        run: xcodebuild -resolvePackageDependencies -project CinePlayer.xcodeproj -scheme CinePlayer -skipPackagePluginValidation -skipMacroValidation
 
       - name: Build unsigned Release iOS app
         run: |
@@ -40,6 +40,8 @@ jobs:
             -scheme CinePlayer \
             -configuration Release \
             -destination "generic/platform=iOS" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             DEVELOPMENT_TEAM="" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
