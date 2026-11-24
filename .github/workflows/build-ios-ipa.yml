@@ -148,6 +148,8 @@ jobs:
           print("Patched Info.plist UIFileSharingEnabled=True")
           app_path = pathlib.Path("CinePlayer/CinePlayerApp.swift")
           app_txt = app_path.read_text(encoding="utf-8")
+          if "import Foundation" not in app_txt:
+            app_txt = "import Foundation\n" + app_txt
           t_app = "\n".join([
             "            #else",
             "                .onOpenURL { url in",
@@ -165,12 +167,13 @@ jobs:
             "                        sessionStore.open(url: url)",
             "                    }",
             "                    #if DEBUG",
-            "                    else if url.scheme == \"cineplayer\",",
-            "                            url.host(percentEncoded: false) == \"smoke\",",
-            "                            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),",
-            "                            let name = components.queryItems?.first(where: { $0.name == \"file\" })?.value,",
-            "                            !name.isEmpty,",
-            "                            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first",
+            "                    if !url.isFileURL,",
+            "                       url.scheme == \"cineplayer\",",
+            "                       url.host(percentEncoded: false) == \"smoke\",",
+            "                       let components = URLComponents(url: url, resolvingAgainstBaseURL: false),",
+            "                       let name = components.queryItems?.first(where: { $0.name == \"file\" })?.value,",
+            "                       !name.isEmpty,",
+            "                       let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first",
             "                    {",
             "                        let targetURL = docs.appendingPathComponent((name as NSString).lastPathComponent)",
             "                        sessionStore.open(url: targetURL)",
