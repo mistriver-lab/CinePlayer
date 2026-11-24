@@ -13,6 +13,30 @@ struct CinePlayerApp: App {
     @StateObject private var sessionStore = PlayerSessionStore.shared
     @StateObject private var playerModel = VideoPlayerModel()
 
+    private let sharedModelContainer: ModelContainer = {
+        let schema = Schema([PlaybackHistoryRecord.self])
+        let persistentConfig = ModelConfiguration(
+            schema: schema,
+            isStoredInMemoryOnly: false,
+            cloudKitDatabase: .none
+        )
+        do {
+            return try ModelContainer(for: schema, configurations: [persistentConfig])
+        } catch {
+            NSLog("GlassMPV failed to create persistent ModelContainer: %@", String(describing: error))
+            let memoryConfig = ModelConfiguration(
+                schema: schema,
+                isStoredInMemoryOnly: true,
+                cloudKitDatabase: .none
+            )
+            do {
+                return try ModelContainer(for: schema, configurations: [memoryConfig])
+            } catch {
+                fatalError("Could not create ModelContainer: \(error)")
+            }
+        }
+    }()
+
     #if os(iOS)
     @UIApplicationDelegateAdaptor(CinePlayerIOSAppDelegate.self) var iosAppDelegate
     #endif
@@ -58,7 +82,7 @@ struct CinePlayerApp: App {
         ContentView()
             .environmentObject(sessionStore)
             .environmentObject(playerModel)
-            .modelContainer(for: [PlaybackHistoryRecord.self])
+            .modelContainer(sharedModelContainer)
             #if os(macOS)
                 .environmentObject(windowController)
             #else
