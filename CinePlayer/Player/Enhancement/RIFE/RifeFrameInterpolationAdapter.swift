@@ -42,10 +42,17 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     private var lastDims: (Int, Int)?
     private var perfSamplesMs: [Double] = []
     private var framesSinceLastSwitch: Int = 0
+    private var consecutiveOverBudgetFrames: Int = 0
+    private var overloadSkipRemaining: Int = 0
+    private var lastDiagLogNs: UInt64 = 0
+    private var lastThermalWarnNs: UInt64 = 0
     private var adaptiveDowngradeEnabled: Bool = true
-    private static let perfWindowSize = 30
-    private static let switchCooldownFrames = 60
+    private static let perfWindowSize = 12
+    private static let switchCooldownFrames = 20
     private static let downgradeBudgetRatio = 0.9 // p90 > 0.9 × budget triggers downgrade
+    private static let overloadPassBudgetRatio = 1.25
+    private static let overloadConsecutiveThreshold = 6
+    private static let overloadCooldownFrames = 30
 
     /// Enable / disable runtime auto-downgrade. Disabled when the user picks an
     /// explicit tier — their choice is honored even if the device can't keep up.
@@ -58,6 +65,10 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 effectiveTier = nil
                 perfSamplesMs.removeAll(keepingCapacity: true)
                 framesSinceLastSwitch = 0
+                consecutiveOverBudgetFrames = 0
+                overloadSkipRemaining = 0
+                lastDiagLogNs = 0
+                lastThermalWarnNs = 0
             }
         }
     }
@@ -84,6 +95,10 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             lastDims = nil
             perfSamplesMs.removeAll(keepingCapacity: true)
             framesSinceLastSwitch = 0
+            consecutiveOverBudgetFrames = 0
+            overloadSkipRemaining = 0
+            lastDiagLogNs = 0
+            lastThermalWarnNs = 0
             #if targetEnvironment(simulator)
             didLogSimulatorFallback = false
             #endif
@@ -138,6 +153,24 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 ])
             }
 
+            if ProcessInfo.processInfo.thermalState == .critical {
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
+                    lastThermalWarnNs = nowNs
+                    EnhancementTelemetryCollector.shared.recordDowngrade(
+                        reason: "RIFE thermal critical -> passthrough"
+                    )
+                }
+                stream?.reset()
+                return .passthrough
+            }
+
+            if overloadSkipRemaining > 0 {
+                overloadSkipRemaining -= 1
+                stream?.reset()
+                return .passthrough
+            }
+
             let width = CVPixelBufferGetWidth(current.pixelBuffer)
             let height = CVPixelBufferGetHeight(current.pixelBuffer)
             guard width > 0, height > 0 else { return .passthrough }
@@ -148,6 +181,10 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 effectiveTier = tier
                 perfSamplesMs.removeAll(keepingCapacity: true)
                 framesSinceLastSwitch = 0
+                consecutiveOverBudgetFrames = 0
+                overloadSkipRemaining = 0
+                lastDiagLogNs = 0
+                lastThermalWarnNs = 0
                 lastDims = dims
             }
             let activeTier = effectiveTier ?? tier
@@ -200,21 +237,44 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             ]
             let tEnd = DispatchTime.now().uptimeNanoseconds
             let totalMs = Double(tEnd - totalStart) / 1_000_000
-            let vtMs    = Double(tAfterVT - totalStart)   / 1_000_000
-            let poolMs  = Double(tAfterPool - tAfterVT)   / 1_000_000
-            let inferMs = Double(tAfterInfer - tAfterPool) / 1_000_000
-            let postMs  = Double(tEnd - tAfterInfer)       / 1_000_000
-            cinemoreLog(
-                level: .debug,
-                "[VFI-RIFE] diag total=\(String(format: "%.1f", totalMs))ms" +
-                " (vt=\(String(format: "%.1f", vtMs))" +
-                " pool=\(String(format: "%.1f", poolMs))" +
-                " infer=\(String(format: "%.1f", inferMs))" +
-                " post=\(String(format: "%.1f", postMs)))" +
-                " tier=\(activeTier.rawValue) \(width)x\(height)"
-            )
+            if lastDiagLogNs == 0 || tEnd &- lastDiagLogNs >= 1_000_000_000 {
+                lastDiagLogNs = tEnd
+                let vtMs    = Double(tAfterVT - totalStart)   / 1_000_000
+                let poolMs  = Double(tAfterPool - tAfterVT)   / 1_000_000
+                let inferMs = Double(tAfterInfer - tAfterPool) / 1_000_000
+                let postMs  = Double(tEnd - tAfterInfer)       / 1_000_000
+                let thermal = DiagnosticLogStore.currentThermalStateText()
+                cinemoreLog(
+                    level: .debug,
+                    "[VFI-RIFE] diag total=\(String(format: "%.1f", totalMs))ms" +
+                    " (vt=\(String(format: "%.1f", vtMs))" +
+                    " pool=\(String(format: "%.1f", poolMs))" +
+                    " infer=\(String(format: "%.1f", inferMs))" +
+                    " post=\(String(format: "%.1f", postMs)))" +
+                    " tier=\(activeTier.rawValue) \(width)x\(height) thermal=\(thermal)"
+                )
+            }
 
             adaptTierIfNeededOnQueue(elapsedMs: totalMs, fps: current.fps, currentTier: activeTier)
+
+            if adaptiveDowngradeEnabled, activeTier == .fast, current.fps > 0.5 {
+                let budgetMs = 1000.0 / Double(current.fps)
+                if totalMs > budgetMs * Self.overloadPassBudgetRatio {
+                    consecutiveOverBudgetFrames += 1
+                    if consecutiveOverBudgetFrames >= Self.overloadConsecutiveThreshold {
+                        overloadSkipRemaining = Self.overloadCooldownFrames
+                        consecutiveOverBudgetFrames = 0
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "RIFE fast over-budget -> cooldown passthrough"
+                        )
+                    }
+                } else {
+                    consecutiveOverBudgetFrames = 0
+                }
+            } else {
+                consecutiveOverBudgetFrames = 0
+            }
+
             return .replaceMany(generated)
         }
     }
@@ -254,8 +314,13 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             level: .warning,
             "[VFI-RIFE] auto-downgrade \(currentTier.rawValue) → \(next.rawValue) (p90=\(String(format: "%.1f", p90))ms budget=\(String(format: "%.1f", budgetMs))ms fps=\(fps))"
         )
+        EnhancementTelemetryCollector.shared.recordDowngrade(
+            reason: "RIFE \(currentTier.rawValue) -> \(next.rawValue) (p90=\(String(format: "%.1f", p90))ms)",
+            detail: next.rawValue
+        )
         effectiveTier = next
         framesSinceLastSwitch = 0
+        consecutiveOverBudgetFrames = 0
         perfSamplesMs.removeAll(keepingCapacity: true)
         // Force RifeStream rebuild on next frame with the new tier.
         stream = nil

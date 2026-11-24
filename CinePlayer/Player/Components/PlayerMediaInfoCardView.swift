@@ -565,6 +565,16 @@ struct PlayerStatsHUDView: View {
         return "\(stats.strategy) (\(stats.detail))"
     }
 
+    private var thermalColor: Color {
+        switch stats.thermalState {
+        case "nominal": .green
+        case "fair": .yellow
+        case "serious": .orange
+        case "critical": .red
+        default: .white.opacity(0.92)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
@@ -593,7 +603,13 @@ struct PlayerStatsHUDView: View {
                     stats.measuredOutputFPS,
                     stats.avgFrameTimeMs
                 ))
-                Text("Replaced: \(stats.replacedFrames)  Pass: \(stats.passthroughFrames)  Bypass: \(stats.bypassEvents)")
+                Text("Replaced: \(stats.replacedFrames)  Pass: \(stats.passthroughFrames)  Bypass: \(stats.bypassEvents)  TO: \(stats.timeoutEvents)")
+                Text("Thermal: \(stats.thermalState)")
+                    .foregroundColor(thermalColor)
+                if !stats.downgradeReason.isEmpty {
+                    Text("Guard: \(stats.downgradeReason)")
+                        .foregroundColor(.orange)
+                }
             }
             .font(.system(size: 11, design: .monospaced))
             .foregroundColor(.white.opacity(0.92))

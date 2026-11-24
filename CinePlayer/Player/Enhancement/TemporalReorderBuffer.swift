@@ -15,6 +15,7 @@
 
         func accept(
             _ ctx: VideoFrameContext,
+            onPrefetchNext: ((PreviousVideoFrameSnapshot, VideoFrameContext) -> Void)? = nil,
             buildSegment: (PreviousVideoFrameSnapshot, VideoFrameContext) -> VideoFrameResult
         ) -> VideoFrameResult {
             if let lastSeenGeneration, lastSeenGeneration != ctx.generation {
@@ -30,7 +31,9 @@
 
             let current = reorder.removeFirst()
             guard let previous else {
-                previous = snapshot(from: current)
+                let newPrev = snapshot(from: current)
+                self.previous = newPrev
+                triggerPrefetchIfPossible(previous: newPrev, onPrefetchNext: onPrefetchNext)
                 return rawFrameResult(from: current)
             }
             guard current.timestamp > previous.timestamp else {
@@ -39,11 +42,27 @@
             }
 
             let result = buildSegment(previous, current)
-            self.previous = snapshot(from: current)
+            let newPrev = snapshot(from: current)
+            self.previous = newPrev
+            triggerPrefetchIfPossible(previous: newPrev, onPrefetchNext: onPrefetchNext)
             if case .replaceMany = result {
                 return result
             }
             return rawFrameResult(from: current)
+        }
+
+        private func triggerPrefetchIfPossible(
+            previous: PreviousVideoFrameSnapshot,
+            onPrefetchNext: ((PreviousVideoFrameSnapshot, VideoFrameContext) -> Void)?
+        ) {
+            guard let onPrefetchNext,
+                  let next = reorder.first,
+                  next.timestamp > previous.timestamp,
+                  next.generation == previous.generation
+            else {
+                return
+            }
+            onPrefetchNext(previous, next)
         }
 
         func onInvalidate() {

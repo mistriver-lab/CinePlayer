@@ -20,6 +20,117 @@
         let backwardFlow: CVPixelBuffer
     }
 
+    nonisolated private struct OpticalFlowFusedParams {
+        var t: Float
+        var flowErrorPivot: Float
+    }
+
+    nonisolated private final class OpticalFlowDownscaler: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pool: CVPixelBufferPool?
+        private var poolKey: (Int, Int)?
+        private var transferSession: VTPixelTransferSession?
+
+        static func targetSize(width: Int, height: Int) -> (Int, Int) {
+            let longSide = max(width, height)
+            let shortSide = min(width, height)
+            if longSide <= 640 && shortSide <= 360 {
+                return (width, height)
+            }
+            let scale = min(640.0 / Double(longSide), 360.0 / Double(shortSide))
+            let scaledW = max(16, (Int(Double(width) * scale) / 2) * 2)
+            let scaledH = max(16, (Int(Double(height) * scale) / 2) * 2)
+            return (scaledW, scaledH)
+        }
+
+        func downscaleIfNeeded(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+            let srcW = CVPixelBufferGetWidth(buffer)
+            let srcH = CVPixelBufferGetHeight(buffer)
+            guard srcW > 0, srcH > 0 else { return nil }
+
+            let (dstW, dstH) = Self.targetSize(width: srcW, height: srcH)
+            let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+            if srcW == dstW, srcH == dstH, pixelFormat == kCVPixelFormatType_32BGRA {
+                return buffer
+            }
+
+            lock.lock()
+            defer { lock.unlock() }
+            guard let outBuffer = ensureBufferOnLock(width: dstW, height: dstH),
+                  let session = ensureTransferSessionOnLock()
+            else {
+                return nil
+            }
+            guard VTPixelTransferSessionTransferImage(session, from: buffer, to: outBuffer) == noErr else {
+                return nil
+            }
+            return outBuffer
+        }
+
+        func reset() {
+            lock.lock()
+            if let session = transferSession {
+                VTPixelTransferSessionInvalidate(session)
+            }
+            transferSession = nil
+            pool = nil
+            poolKey = nil
+            lock.unlock()
+        }
+
+        private func ensureTransferSessionOnLock() -> VTPixelTransferSession? {
+            if let transferSession {
+                return transferSession
+            }
+            var session: VTPixelTransferSession?
+            guard VTPixelTransferSessionCreate(
+                allocator: kCFAllocatorDefault,
+                pixelTransferSessionOut: &session
+            ) == noErr,
+            let session
+            else {
+                return nil
+            }
+            transferSession = session
+            return session
+        }
+
+        private func ensureBufferOnLock(width: Int, height: Int) -> CVPixelBuffer? {
+            let key = (width, height)
+            if let existing = poolKey, existing == key, let pool {
+                var buf: CVPixelBuffer?
+                guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buf) == kCVReturnSuccess,
+                      let buf
+                else {
+                    return nil
+                }
+                return buf
+            }
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            ]
+            var newPool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &newPool) == kCVReturnSuccess,
+                  let newPool
+            else {
+                return nil
+            }
+            pool = newPool
+            poolKey = key
+            var buf: CVPixelBuffer?
+            guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, newPool, &buf) == kCVReturnSuccess,
+                  let buf
+            else {
+                return nil
+            }
+            return buf
+        }
+    }
+
     nonisolated final class OpticalFlowAsyncProvider: @unchecked Sendable {
         private let flowQueue = DispatchQueue(
             label: "cn.com.cinemore.opticalflow.async-provider",
@@ -92,18 +203,15 @@
         }
     }
 
-    /// 光流补帧适配器：计算前后向光流，Metal 着色器分别对 prev/next 做 backward-warp，
-    /// 再用颜色 + 光流双重置信度合成中间帧，遮挡/大位移区域回退到时间上更近的一帧，
-    /// 避免单向光流 + 交叉淡化导致的鬼影/双影。供 temporal 帧回调 replaceMany 使用。
+    /// 光流补帧适配器：计算下采样前后向光流，单 Pass Metal 融合着色器完成双向 backward-warp、
+    /// 前后向与颜色双重置信度计算及合成，避免多 Pass 中间纹理与 barrier 开销，并防止大位移/遮挡鬼影。
     nonisolated final class OpticalFlowFrameInterpolationAdapter: @unchecked Sendable {
         static let shared = OpticalFlowFrameInterpolationAdapter()
 
         private let queue = DispatchQueue(label: "cn.com.cinemore.opticalflow.adapter", qos: .userInitiated)
         private var device: MTLDevice?
         private var textureCache: CVMetalTextureCache?
-        private var warpPipelineState: MTLComputePipelineState?
-        private var consistencyPipelineState: MTLComputePipelineState?
-        private var composePipelineState: MTLComputePipelineState?
+        private var fusedPipelineState: MTLComputePipelineState?
         private var library: MTLLibrary?
         private var commandQueue: MTLCommandQueue?
         private var outputPool: CVPixelBufferPool?
@@ -111,15 +219,14 @@
         private var bgraConversionPool: CVPixelBufferPool?
         private var bgraConversionPoolKey: (Int, Int)?
         private var pixelTransferSession: VTPixelTransferSession?
+        private let flowDownscaler = OpticalFlowDownscaler()
         private var asyncFlowProvider: OpticalFlowAsyncProvider
+        private var cacheHits: Int = 0
+        private var cacheMisses: Int = 0
+        private var lastDiagLogNs: UInt64 = 0
+        private var lastThermalWarnNs: UInt64 = 0
 
-        // 中间纹理（compute-only，IOSurface 无关，按分辨率缓存）。
-        private var warpedPrevTexture: MTLTexture?
-        private var warpedNextTexture: MTLTexture?
-        private var consistencyTexture: MTLTexture?
-        private var intermediateTextureKey: (Int, Int)?
-
-        /// 前后向残差的 smoothstep 中心（像素单位）。低于 0.5× 完全可信，高于 1.5× 完全不可信。
+        /// 前后向残差的 smoothstep 中心（输出像素单位）。低于 0.5× 完全可信，高于 1.5× 完全不可信。
         private static let flowErrorPivot: Float = 1.5
 
         init() {
@@ -133,23 +240,22 @@
         nonisolated func endSession() {
             queue.sync {
                 textureCache = nil
-                warpPipelineState = nil
-                consistencyPipelineState = nil
-                composePipelineState = nil
+                fusedPipelineState = nil
                 library = nil
                 commandQueue = nil
                 outputPool = nil
                 outputPoolKey = nil
                 bgraConversionPool = nil
                 bgraConversionPoolKey = nil
-                warpedPrevTexture = nil
-                warpedNextTexture = nil
-                consistencyTexture = nil
-                intermediateTextureKey = nil
                 if let session = pixelTransferSession {
                     VTPixelTransferSessionInvalidate(session)
                 }
                 pixelTransferSession = nil
+                cacheHits = 0
+                cacheMisses = 0
+                lastDiagLogNs = 0
+                lastThermalWarnNs = 0
+                flowDownscaler.reset()
                 asyncFlowProvider.reset()
             }
         }
@@ -233,6 +339,17 @@
                     return .replaceMany(generated)
                 }
 
+                if ProcessInfo.processInfo.thermalState == .critical {
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
+                        lastThermalWarnNs = nowNs
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "OF thermal critical -> passthrough"
+                        )
+                    }
+                    return .passthrough
+                }
+
                 let width = CVPixelBufferGetWidth(current.pixelBuffer)
                 let height = CVPixelBufferGetHeight(current.pixelBuffer)
                 guard width > 0, height > 0 else {
@@ -242,9 +359,7 @@
                 guard let resources = ensureMetalResourcesOnQueue() else {
                     return .passthrough
                 }
-                let warpPipeline = resources.warpPipeline
-                let consistencyPipeline = resources.consistencyPipeline
-                let composePipeline = resources.composePipeline
+                let fusedPipeline = resources.fusedPipeline
                 let commandQueue = resources.commandQueue
                 let cache = resources.textureCache
 
@@ -267,9 +382,14 @@
                     height: height
                 )
                 let visionStart = DispatchTime.now().uptimeNanoseconds
-                let flowPair =
-                    asyncFlowProvider.cachedResult(for: requestKey)
-                    ?? createOpticalFlowPair(source: firstBGRA, target: secondBGRA)
+                let flowPair: OpticalFlowPair?
+                if let cached = asyncFlowProvider.cachedResult(for: requestKey) {
+                    cacheHits += 1
+                    flowPair = cached
+                } else {
+                    cacheMisses += 1
+                    flowPair = createOpticalFlowPair(source: firstBGRA, target: secondBGRA)
+                }
                 guard let flowPair else {
                     cinemoreLog(level: .debug, "[VFI-OF] optical flow pair unavailable")
                     return .passthrough
@@ -281,16 +401,19 @@
                 }
                 current.pixelBuffer.copyPropagatedAttachments(to: outBuffer)
 
-                guard let (warpedPrev, warpedNext, consistency) = ensureIntermediateTextures(width: width, height: height, device: resources.device)
-                else {
-                    cinemoreLog(level: .debug, "[VFI-OF] intermediate textures alloc failed")
+                let fwdFlowW = CVPixelBufferGetWidth(flowPair.forwardFlow)
+                let fwdFlowH = CVPixelBufferGetHeight(flowPair.forwardFlow)
+                let bwdFlowW = CVPixelBufferGetWidth(flowPair.backwardFlow)
+                let bwdFlowH = CVPixelBufferGetHeight(flowPair.backwardFlow)
+                guard fwdFlowW > 0, fwdFlowH > 0, bwdFlowW > 0, bwdFlowH > 0 else {
+                    cinemoreLog(level: .debug, "[VFI-OF] invalid flow dimensions")
                     return .passthrough
                 }
 
                 let firstTex = makeTextureFromPixelBuffer(firstBGRA, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm)
                 let secondTex = makeTextureFromPixelBuffer(secondBGRA, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm)
-                let forwardFlowTex = makeTextureFromFlowBuffer(flowPair.forwardFlow, textureCache: cache, width: width, height: height)
-                let backwardFlowTex = makeTextureFromFlowBuffer(flowPair.backwardFlow, textureCache: cache, width: width, height: height)
+                let forwardFlowTex = makeTextureFromFlowBuffer(flowPair.forwardFlow, textureCache: cache, width: fwdFlowW, height: fwdFlowH)
+                let backwardFlowTex = makeTextureFromFlowBuffer(flowPair.backwardFlow, textureCache: cache, width: bwdFlowW, height: bwdFlowH)
                 let outTex = makeTextureFromPixelBuffer(outBuffer, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm)
 
                 guard let firstTex, let secondTex, let forwardFlowTex, let backwardFlowTex, let outTex else {
@@ -304,64 +427,23 @@
                     return .passthrough
                 }
 
-                // t=0.5 正中插值；scale 分别为 t 和 (1-t)。
-                let t: Float = 0.5
-                let prevWarpScale: Float = t
-                let nextWarpScale: Float = 1.0 - t
-
-                /// 三个 pipeline 的 threadgroup 尺寸略有差异，按各自的 threadExecutionWidth 取。
-                func dispatch(pipeline: MTLComputePipelineState) {
-                    let tw = pipeline.threadExecutionWidth
-                    let th = min(16, max(1, pipeline.maxTotalThreadsPerThreadgroup / tw))
-                    let groups = MTLSize(
-                        width: (width + tw - 1) / tw,
-                        height: (height + th - 1) / th,
-                        depth: 1
-                    )
-                    encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
-                }
-
-                // 1) warp prev: forward flow × t
-                encoder.setComputePipelineState(warpPipeline)
+                var params = OpticalFlowFusedParams(t: 0.5, flowErrorPivot: Self.flowErrorPivot)
+                encoder.setComputePipelineState(fusedPipeline)
                 encoder.setTexture(firstTex, index: 0)
-                encoder.setTexture(forwardFlowTex, index: 1)
-                encoder.setTexture(warpedPrev, index: 2)
-                var prevScale = prevWarpScale
-                encoder.setBytes(&prevScale, length: MemoryLayout<Float>.size, index: 0)
-                dispatch(pipeline: warpPipeline)
+                encoder.setTexture(secondTex, index: 1)
+                encoder.setTexture(forwardFlowTex, index: 2)
+                encoder.setTexture(backwardFlowTex, index: 3)
+                encoder.setTexture(outTex, index: 4)
+                encoder.setBytes(&params, length: MemoryLayout<OpticalFlowFusedParams>.stride, index: 0)
 
-                // 2) warp next: backward flow × (1 - t)
-                encoder.setTexture(secondTex, index: 0)
-                encoder.setTexture(backwardFlowTex, index: 1)
-                encoder.setTexture(warpedNext, index: 2)
-                var nextScale = nextWarpScale
-                encoder.setBytes(&nextScale, length: MemoryLayout<Float>.size, index: 0)
-                dispatch(pipeline: warpPipeline)
-
-                // 3) 前后向一致性（与 warp 无依赖，可同 encoder）
-                encoder.setComputePipelineState(consistencyPipeline)
-                encoder.setTexture(forwardFlowTex, index: 0)
-                encoder.setTexture(backwardFlowTex, index: 1)
-                encoder.setTexture(consistency, index: 2)
-                dispatch(pipeline: consistencyPipeline)
-
-                // compose 读 warpedPrev/warpedNext/consistency，必须等上面三次写入完成。
-                encoder.memoryBarrier(scope: .textures)
-
-                // 4) compose：颜色 + 光流双重置信度，低置信度区域退回到未 warp 的
-                // prev/next 交叉淡化（对称，不会在 t=0.5 偏向某帧）。
-                encoder.setComputePipelineState(composePipeline)
-                encoder.setTexture(warpedPrev, index: 0)
-                encoder.setTexture(warpedNext, index: 1)
-                encoder.setTexture(firstTex, index: 2)
-                encoder.setTexture(secondTex, index: 3)
-                encoder.setTexture(consistency, index: 4)
-                encoder.setTexture(outTex, index: 5)
-                var composeT = t
-                var pivot = Self.flowErrorPivot
-                encoder.setBytes(&composeT, length: MemoryLayout<Float>.size, index: 0)
-                encoder.setBytes(&pivot, length: MemoryLayout<Float>.size, index: 1)
-                dispatch(pipeline: composePipeline)
+                let tw = fusedPipeline.threadExecutionWidth
+                let th = min(16, max(1, fusedPipeline.maxTotalThreadsPerThreadgroup / tw))
+                let groups = MTLSize(
+                    width: (width + tw - 1) / tw,
+                    height: (height + th - 1) / th,
+                    depth: 1
+                )
+                encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
 
                 encoder.endEncoding()
                 cmdBuffer.commit()
@@ -380,11 +462,18 @@
                     GeneratedVideoFrame(pixelBuffer: outBuffer, timestamp: prevTs, duration: firstDuration),
                     GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: midTs, duration: secondDuration),
                 ]
-                let totalMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart) / 1_000_000
-                cinemoreLog(
-                    level: .debug,
-                    "[VFI-OF] diag total=\(String(format: "%.1f", totalMs))ms vision2x=\(String(format: "%.1f", visionMs))ms metal=\(String(format: "%.1f", totalMs - visionMs))ms \(width)x\(height)"
-                )
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if lastDiagLogNs == 0 || nowNs &- lastDiagLogNs >= 1_000_000_000 {
+                    lastDiagLogNs = nowNs
+                    let totalMs = Double(nowNs - totalStart) / 1_000_000
+                    let metalMs = max(0, totalMs - visionMs)
+                    let totalLookups = cacheHits + cacheMisses
+                    let thermal = DiagnosticLogStore.currentThermalStateText()
+                    cinemoreLog(
+                        level: .debug,
+                        "[VFI-OF] diag total=\(String(format: "%.1f", totalMs))ms vision2x=\(String(format: "%.1f", visionMs))ms metal=\(String(format: "%.1f", metalMs))ms flow=\(fwdFlowW)x\(fwdFlowH) out=\(width)x\(height) hit=\(cacheHits)/\(totalLookups) thermal=\(thermal)"
+                    )
+                }
                 return .replaceMany(generated)
             }
         }
@@ -394,9 +483,7 @@
         private struct MetalResources {
             let device: MTLDevice
             let library: MTLLibrary
-            let warpPipeline: MTLComputePipelineState
-            let consistencyPipeline: MTLComputePipelineState
-            let composePipeline: MTLComputePipelineState
+            let fusedPipeline: MTLComputePipelineState
             let commandQueue: MTLCommandQueue
             let textureCache: CVMetalTextureCache
         }
@@ -419,25 +506,11 @@
                 library = lib
             }
 
-            guard let warpPipe = warpPipelineState ?? makePipeline(device: dev, library: lib, function: "opticalFlowWarp") else {
+            guard let fusedPipe = fusedPipelineState ?? makePipeline(device: dev, library: lib, function: "opticalFlowInterpolateFused") else {
                 return nil
             }
-            if warpPipelineState == nil {
-                warpPipelineState = warpPipe
-            }
-
-            guard let consistencyPipe = consistencyPipelineState ?? makePipeline(device: dev, library: lib, function: "opticalFlowConsistency") else {
-                return nil
-            }
-            if consistencyPipelineState == nil {
-                consistencyPipelineState = consistencyPipe
-            }
-
-            guard let composePipe = composePipelineState ?? makePipeline(device: dev, library: lib, function: "opticalFlowCompose") else {
-                return nil
-            }
-            if composePipelineState == nil {
-                composePipelineState = composePipe
+            if fusedPipelineState == nil {
+                fusedPipelineState = fusedPipe
             }
 
             guard let cmdQueue = commandQueue ?? dev.makeCommandQueue() else {
@@ -455,9 +528,7 @@
             return MetalResources(
                 device: dev,
                 library: lib,
-                warpPipeline: warpPipe,
-                consistencyPipeline: consistencyPipe,
-                composePipeline: composePipe,
+                fusedPipeline: fusedPipe,
                 commandQueue: cmdQueue,
                 textureCache: cache
             )
@@ -492,51 +563,6 @@
             }
             textureCache = cache
             return cache
-        }
-
-        /// 按 (width, height) 缓存 warpedPrev/warpedNext（BGRA8Unorm）与 consistency（R16Float），
-        /// 全部 storage=.private，shaderRead+shaderWrite，只在 GPU 内部流转，不走 IOSurface。
-        private func ensureIntermediateTextures(
-            width: Int,
-            height: Int,
-            device: MTLDevice
-        ) -> (MTLTexture, MTLTexture, MTLTexture)? {
-            let key = (width, height)
-            if let existing = intermediateTextureKey, existing == key,
-               let a = warpedPrevTexture, let b = warpedNextTexture, let c = consistencyTexture
-            {
-                return (a, b, c)
-            }
-
-            let bgraDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm,
-                width: width,
-                height: height,
-                mipmapped: false
-            )
-            bgraDesc.usage = [.shaderRead, .shaderWrite]
-            bgraDesc.storageMode = .private
-
-            let consistencyDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .r16Float,
-                width: width,
-                height: height,
-                mipmapped: false
-            )
-            consistencyDesc.usage = [.shaderRead, .shaderWrite]
-            consistencyDesc.storageMode = .private
-
-            guard let a = device.makeTexture(descriptor: bgraDesc),
-                  let b = device.makeTexture(descriptor: bgraDesc),
-                  let c = device.makeTexture(descriptor: consistencyDesc)
-            else {
-                return nil
-            }
-            warpedPrevTexture = a
-            warpedNextTexture = b
-            consistencyTexture = c
-            intermediateTextureKey = key
-            return (a, b, c)
         }
 
         private func ensureOutputPool(width: Int, height: Int) -> CVPixelBuffer? {
@@ -633,11 +659,30 @@
             source: CVPixelBuffer,
             target: CVPixelBuffer
         ) -> OpticalFlowPair? {
-            guard let forwardFlow = createOpticalFlow(source: source, target: target) else {
+            let origW = CVPixelBufferGetWidth(source)
+            let origH = CVPixelBufferGetHeight(source)
+            guard origW > 0, origH > 0,
+                  let smallSrc = flowDownscaler.downscaleIfNeeded(source),
+                  let smallDst = flowDownscaler.downscaleIfNeeded(target)
+            else {
+                cinemoreLog(level: .debug, "[VFI-OF] downscale for optical flow failed")
+                return nil
+            }
+            guard let forwardFlow = createOpticalFlow(
+                source: smallSrc,
+                target: smallDst,
+                originalWidth: origW,
+                originalHeight: origH
+            ) else {
                 cinemoreLog(level: .debug, "[VFI-OF] forward flow failed")
                 return nil
             }
-            guard let backwardFlow = createOpticalFlow(source: target, target: source) else {
+            guard let backwardFlow = createOpticalFlow(
+                source: smallDst,
+                target: smallSrc,
+                originalWidth: origW,
+                originalHeight: origH
+            ) else {
                 cinemoreLog(level: .debug, "[VFI-OF] backward flow failed")
                 return nil
             }
@@ -645,14 +690,25 @@
         }
 
         /// 单向光流：source → target 的像素位移场（RG32Float）。
-        private func createOpticalFlow(source: CVPixelBuffer, target: CVPixelBuffer) -> CVPixelBuffer? {
+        private func createOpticalFlow(
+            source: CVPixelBuffer,
+            target: CVPixelBuffer,
+            originalWidth: Int,
+            originalHeight: Int
+        ) -> CVPixelBuffer? {
             // autoreleasepool 强制 drain Vision 内部临时 IOSurface；
             // 否则 Swift + GCD queue.sync 不会在 block 结束时 drain Obj-C autorelease pool，
             // float 光流 buffer 持续累积会触发 per-client 16384 IOSurface 配额上限。
             autoreleasepool {
                 let request = VNGenerateOpticalFlowRequest(targetedCVPixelBuffer: target, orientation: .up)
                 request.revision = VNGenerateOpticalFlowRequestRevision1
-                request.computationAccuracy = .medium
+                #if os(iOS)
+                    request.computationAccuracy = min(originalWidth, originalHeight) > 540 ? .low : .medium
+                #else
+                    _ = originalWidth
+                    _ = originalHeight
+                    request.computationAccuracy = .medium
+                #endif
                 let handler = VNImageRequestHandler(cvPixelBuffer: source, options: [:])
                 do {
                     try handler.perform([request])
@@ -720,22 +776,29 @@
     nonisolated private final class OpticalFlowTemporalProcessor: VideoFrameProcessor, @unchecked Sendable {
         private let adapter: OpticalFlowFrameInterpolationAdapter
         private let buffer = TemporalReorderBuffer()
-        private var lastPrefetchSnapshot: PreviousVideoFrameSnapshot?
 
         init(adapter: OpticalFlowFrameInterpolationAdapter) {
             self.adapter = adapter
         }
 
         func onFrame(_ ctx: VideoFrameContext) -> VideoFrameResult {
-            prefetchIfPossible(next: ctx)
-            lastPrefetchSnapshot = makePrefetchSnapshot(from: ctx)
-            return buffer.accept(ctx) { previous, current in
-                adapter.processTemporal(previous: previous, current: current)
-            }
+            buffer.accept(
+                ctx,
+                onPrefetchNext: { [adapter] prev, next in
+                    adapter.prefetchFlow(
+                        previous: prev,
+                        currentPixelBuffer: next.pixelBuffer,
+                        currentTimestamp: next.timestamp,
+                        generation: next.generation
+                    )
+                },
+                buildSegment: { [adapter] previous, current in
+                    adapter.processTemporal(previous: previous, current: current)
+                }
+            )
         }
 
         func onInvalidate(newGeneration _: Int64) {
-            lastPrefetchSnapshot = nil
             buffer.onInvalidate()
             adapter.resetPrefetchCache()
         }
@@ -745,42 +808,12 @@
         }
 
         func onDrain() {
-            lastPrefetchSnapshot = nil
             buffer.onDrain()
             adapter.endSession()
         }
 
         var hasPendingFrames: Bool {
             buffer.hasPendingFrames
-        }
-
-        private func prefetchIfPossible(next ctx: VideoFrameContext) {
-            guard let previous = lastPrefetchSnapshot,
-                  previous.generation == ctx.generation,
-                  ctx.timestamp > previous.timestamp
-            else {
-                return
-            }
-            let currentCopy = ctx.pixelBuffer.copy() ?? ctx.pixelBuffer
-            adapter.prefetchFlow(
-                previous: previous,
-                currentPixelBuffer: currentCopy,
-                currentTimestamp: ctx.timestamp,
-                generation: ctx.generation
-            )
-        }
-
-        private func makePrefetchSnapshot(from ctx: VideoFrameContext) -> PreviousVideoFrameSnapshot {
-            let stablePixelBuffer = ctx.pixelBuffer.copy() ?? ctx.pixelBuffer
-            return PreviousVideoFrameSnapshot(
-                pixelBuffer: stablePixelBuffer,
-                timestamp: ctx.timestamp,
-                duration: ctx.duration,
-                timebaseNum: ctx.timebaseNum,
-                timebaseDen: ctx.timebaseDen,
-                fps: ctx.fps,
-                generation: ctx.generation
-            )
         }
     }
 

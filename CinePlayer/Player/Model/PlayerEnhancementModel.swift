@@ -34,6 +34,8 @@ nonisolated struct EnhancementLiveStats: Sendable, Equatable, Codable {
     var measuredOutputFPS: Double
     var avgFrameTimeMs: Double
     var lastFrameTimeMs: Double
+    var thermalState: String
+    var downgradeReason: String
 
     var isActive: Bool {
         replacedFrames > 0
@@ -56,7 +58,9 @@ nonisolated struct EnhancementLiveStats: Sendable, Equatable, Codable {
         measuredInputFPS: 0,
         measuredOutputFPS: 0,
         avgFrameTimeMs: 0,
-        lastFrameTimeMs: 0
+        lastFrameTimeMs: 0,
+        thermalState: "nominal",
+        downgradeReason: ""
     )
 }
 
@@ -81,6 +85,8 @@ nonisolated final class EnhancementTelemetryCollector: @unchecked Sendable {
         var fresh = EnhancementLiveStats.idle
         fresh.strategy = strategy
         fresh.detail = detail
+        fresh.thermalState = DiagnosticLogStore.currentThermalStateText()
+        fresh.downgradeReason = ""
         stats = fresh
         totalFrameTimeMs = 0
         lastPublishUptimeNs = 0
@@ -140,9 +146,10 @@ nonisolated final class EnhancementTelemetryCollector: @unchecked Sendable {
         stats.measuredInputFPS = lastInputFPS
         stats.measuredOutputFPS = lastOutputFPS
 
-        let shouldPublish = lastPublishUptimeNs == 0 || (nowNs - lastPublishUptimeNs) >= 400_000_000
+        let shouldPublish = lastPublishUptimeNs == 0 || (nowNs - lastPublishUptimeNs) >= 1_000_000_000
         let snapshot: EnhancementLiveStats?
         if shouldPublish {
+            stats.thermalState = DiagnosticLogStore.currentThermalStateText()
             lastPublishUptimeNs = nowNs
             snapshot = stats
         } else {
@@ -156,28 +163,74 @@ nonisolated final class EnhancementTelemetryCollector: @unchecked Sendable {
     }
 
     func recordEvent(_ event: FrameCallbackEvent) {
+        var warnSummary: String?
         lock.lock()
         switch event {
         case .callbackTimeout:
             stats.timeoutEvents += 1
+            warnSummary = describeEvent(event)
         case .callbackInvalidResult, .callbackError:
             stats.errorEvents += 1
+            warnSummary = describeEvent(event)
         case .bypassStarted:
             stats.bypassEvents += 1
+            warnSummary = describeEvent(event)
         case .bypassEnded, .warmupReady:
             break
         @unknown default:
             break
         }
+        stats.thermalState = DiagnosticLogStore.currentThermalStateText()
         let snapshot = stats
         lastPublishUptimeNs = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
 
+        if let warnSummary {
+            cinemoreLog(
+                level: .warning,
+                "[EnhancementEvent] \(warnSummary) strategy=\(snapshot.strategy) timeouts=\(snapshot.timeoutEvents) bypass=\(snapshot.bypassEvents)"
+            )
+        }
         publish(snapshot)
+    }
+
+    func recordDowngrade(reason: String, detail: String? = nil) {
+        lock.lock()
+        stats.downgradeReason = reason
+        if let detail {
+            stats.detail = detail
+        }
+        stats.thermalState = DiagnosticLogStore.currentThermalStateText()
+        let snapshot = stats
+        lastPublishUptimeNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+
+        cinemoreLog(level: .warning, "[EnhancementGuard] \(reason)")
+        publish(snapshot)
+    }
+
+    private func describeEvent(_ event: FrameCallbackEvent) -> String {
+        switch event {
+        case let .callbackTimeout(kind, elapsedMs):
+            return "callbackTimeout(\(kind.rawValue), \(String(format: "%.1f", elapsedMs))ms)"
+        case let .callbackInvalidResult(kind, message):
+            return "callbackInvalidResult(\(kind.rawValue), \(message))"
+        case let .callbackError(kind, message):
+            return "callbackError(\(kind.rawValue), \(message))"
+        case let .bypassStarted(kind):
+            return "bypassStarted(\(kind.rawValue))"
+        case let .bypassEnded(kind):
+            return "bypassEnded(\(kind.rawValue))"
+        case let .warmupReady(kind, elapsedMs):
+            return "warmupReady(\(kind.rawValue), \(String(format: "%.1f", elapsedMs))ms)"
+        @unknown default:
+            return "unknown"
+        }
     }
 
     func flush() {
         lock.lock()
+        stats.thermalState = DiagnosticLogStore.currentThermalStateText()
         let snapshot = stats
         lastPublishUptimeNs = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
@@ -194,7 +247,7 @@ nonisolated final class EnhancementTelemetryCollector: @unchecked Sendable {
         let outFPS = String(format: "%.1f", snapshot.measuredOutputFPS)
         let avgMs = String(format: "%.2f", snapshot.avgFrameTimeMs)
         logger.notice(
-            "[EnhancementStats] strategy=\(snapshot.strategy, privacy: .public) detail=\(snapshot.detail, privacy: .public) in=\(snapshot.inputWidth)x\(snapshot.inputHeight) out=\(snapshot.outputWidth)x\(snapshot.outputHeight) inFPS=\(inFPS, privacy: .public) outFPS=\(outFPS, privacy: .public) avgMs=\(avgMs, privacy: .public) inFrames=\(snapshot.inputFrames) outFrames=\(snapshot.outputFrames) replaced=\(snapshot.replacedFrames) passthrough=\(snapshot.passthroughFrames) bypass=\(snapshot.bypassEvents)"
+            "[EnhancementStats] strategy=\(snapshot.strategy, privacy: .public) detail=\(snapshot.detail, privacy: .public) in=\(snapshot.inputWidth)x\(snapshot.inputHeight) out=\(snapshot.outputWidth)x\(snapshot.outputHeight) inFPS=\(inFPS, privacy: .public) outFPS=\(outFPS, privacy: .public) avgMs=\(avgMs, privacy: .public) inFrames=\(snapshot.inputFrames) outFrames=\(snapshot.outputFrames) replaced=\(snapshot.replacedFrames) passthrough=\(snapshot.passthroughFrames) bypass=\(snapshot.bypassEvents) timeout=\(snapshot.timeoutEvents) thermal=\(snapshot.thermalState, privacy: .public)"
         )
 
         #if DEBUG
@@ -1023,21 +1076,15 @@ final class PlayerEnhancementModel: ObservableObject {
     /// active tier is reflected in `currentRifeTier` (published by the adapter
     /// callback).
     var rifeAutoTier: RifeQualityTier {
+        #if os(iOS)
+        // iOS real-time playback always starts at `.fast` to prevent frame budget stalls.
+        return .fast
+        #else
         guard let w = systemMLCurrentVideoWidth,
               let h = systemMLCurrentVideoHeight else {
-            #if os(iOS)
-            return .fast
-            #else
             return .balanced
-            #endif
         }
         let pixels = w * h
-        #if os(iOS)
-        // Conservative initial picks for iOS real-time playback; runtime adaptive
-        // downgrade remains active if inference exceeds source-fps budget.
-        if pixels <= 1280 * 720 { return .balanced }
-        else { return .fast }
-        #else
         // Conservative initial picks calibrated for 30 fps real-time on M-series
         // Mac. The adapter's runtime downgrade catches devices/content where these
         // are still too aggressive (e.g., M1 base, 60 fps source).
@@ -1045,6 +1092,24 @@ final class PlayerEnhancementModel: ObservableObject {
         else if pixels <= 2560 * 1440 { return .balanced }
         else { return .fast }
         #endif
+    }
+
+    var liveStatsSummaryText: String {
+        let s = liveStats
+        let detailSuffix = s.detail.isEmpty ? "" : " (\(s.detail))"
+        let res = (s.inputWidth > 0 && s.outputWidth > 0)
+            ? "\(s.inputWidth)x\(s.inputHeight)->\(s.outputWidth)x\(s.outputHeight)"
+            : "--"
+        let fpsPart = String(
+            format: "%.1f->%.1f fps, avg=%.2fms, last=%.2fms",
+            s.measuredInputFPS,
+            s.measuredOutputFPS,
+            s.avgFrameTimeMs,
+            s.lastFrameTimeMs
+        )
+        let counts = "in=\(s.inputFrames) out=\(s.outputFrames) replaced=\(s.replacedFrames) pass=\(s.passthroughFrames) bypass=\(s.bypassEvents) timeout=\(s.timeoutEvents) error=\(s.errorEvents)"
+        let guardPart = s.downgradeReason.isEmpty ? "" : " guard=\(s.downgradeReason)"
+        return "strategy=\(s.strategy)\(detailSuffix) res=\(res) \(fpsPart) \(counts) thermal=\(s.thermalState)\(guardPart)"
     }
 
     /// Tier currently in use by the adapter. In `.auto` preference mode this
