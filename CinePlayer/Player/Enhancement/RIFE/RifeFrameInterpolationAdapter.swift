@@ -23,6 +23,9 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     // so we don't need a separate field here.
     private var stream: RifeStream?
     private var streamKey: (Int, Int, RifeQualityTier)?
+    #if targetEnvironment(simulator)
+    private var didLogSimulatorFallback: Bool = false
+    #endif
 
     // Per-resolution pixel buffer pools.
     private var outputPool: CVPixelBufferPool?
@@ -81,6 +84,9 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             lastDims = nil
             perfSamplesMs.removeAll(keepingCapacity: true)
             framesSinceLastSwitch = 0
+            #if targetEnvironment(simulator)
+            didLogSimulatorFallback = false
+            #endif
         }
     }
 
@@ -265,6 +271,16 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
         height: Int,
         tier: RifeQualityTier
     ) -> RifeStream? {
+        #if targetEnvironment(simulator)
+        if !didLogSimulatorFallback {
+            didLogSimulatorFallback = true
+            cinemoreLog(
+                level: .warning,
+                "[VFI-RIFE] MPSGraphDevice is unavailable on iOS Simulator (Apple MetalPerformanceShadersGraph NSInvalidArgumentException); falling back to passthrough (\(width)x\(height) tier=\(tier.rawValue))"
+            )
+        }
+        return nil
+        #else
         let key = (width, height, tier)
         if let existing = stream,
            let existingKey = streamKey,
@@ -282,6 +298,7 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             cinemoreLog(level: .debug, "[VFI-RIFE] makeStream init failed: \(error)")
             return nil
         }
+        #endif
     }
 
     private func ensureOutputPool(width: Int, height: Int) -> CVPixelBuffer? {
