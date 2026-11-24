@@ -50,6 +50,7 @@ jobs:
               if new != txt:
                 p.write_text(new, encoding="utf-8")
                 print("Rewrote SSH URLs in", p)
+
           pem = pathlib.Path("CinePlayer/Player/Model/PlayerEnhancementModel.swift")
           s = pem.read_text(encoding="utf-8")
           target = "        currentRifeTier = nil"
@@ -62,18 +63,429 @@ jobs:
 
           pov = pathlib.Path("CinePlayer/Player/Views/PlayerOpenView.swift")
           ps = pov.read_text(encoding="utf-8")
-          t_ut = "            allowedContentTypes: [.movie, .video],"
-          assert ps.count(t_ut) == 1, f"unexpected allowedContentTypes count: {ps.count(t_ut)}"
-          ps = ps.replace(t_ut, "            allowedContentTypes: [.item],", 1)
-          t_cb = "            if case .success(let urls) = result, let url = urls.first {\n                openMedia(url: url)\n            }"
-          assert ps.count(t_cb) == 1, f"unexpected fileImporter callback count: {ps.count(t_cb)}"
-          r_cb = "            if case .success(let urls) = result, let url = urls.first {\n                Task { @MainActor in\n                    try? await Task.sleep(for: .milliseconds(450))\n                    openMedia(url: url)\n                }\n            }"
-          ps = ps.replace(t_cb, r_cb, 1)
+
+          t_imp = """#if os(macOS)
+              import AppKit
+          #else
+              import UIKit
+          #endif"""
+          assert ps.count(t_imp) == 1, f"unexpected import block count: {ps.count(t_imp)}"
+          r_imp = """#if os(macOS)
+              import AppKit
+          #else
+              import UIKit
+          #endif
+          #if os(iOS)
+              import CoreTransferable
+              import PhotosUI
+          #endif"""
+          ps = ps.replace(t_imp, r_imp, 1)
+
+          t_state = "    @State private var showFileImporter = false"
+          assert ps.count(t_state) == 1, f"unexpected showFileImporter state count: {ps.count(t_state)}"
+          r_state = """    @State private var showFileImporter = false
+              #if os(iOS)
+                  @State private var pendingPickedURL: URL?
+                  @State private var selectedPhotoItem: PhotosPickerItem?
+                  @State private var isImportingPhoto = false
+                  @State private var openErrorMessage: String?
+              #endif"""
+          ps = ps.replace(t_state, r_state, 1)
+
+          t_fi = """        .fileImporter(
+                      isPresented: $showFileImporter,
+                      allowedContentTypes: [.movie, .video],
+                      allowsMultipleSelection: false
+                  ) { result in
+                      if case .success(let urls) = result, let url = urls.first {
+                          openMedia(url: url)
+                      }
+                  }"""
+          assert ps.count(t_fi) == 1, f"unexpected fileImporter block count: {ps.count(t_fi)}"
+          r_fi = """        #if os(iOS)
+                  .sheet(isPresented: $showFileImporter, onDismiss: handlePendingPickedFile) {
+                      IOSDocumentPickerView(
+                          onPick: { pickedURL in
+                              pendingPickedURL = pickedURL
+                              showFileImporter = false
+                          },
+                          onCancel: {
+                              showFileImporter = false
+                          },
+                          onError: { message in
+                              openErrorMessage = message
+                              showFileImporter = false
+                          }
+                      )
+                      .ignoresSafeArea()
+                  }
+                  .compatibleOnChange(of: selectedPhotoItem) { newItem in
+                      guard let newItem else { return }
+                      selectedPhotoItem = nil
+                      importFromPhotosItem(newItem)
+                  }
+                  .alert(
+                      "无法打开视频",
+                      isPresented: Binding(
+                          get: { activeOpenErrorMessage != nil },
+                          set: { isPresented in
+                              if !isPresented {
+                                  openErrorMessage = nil
+                                  sessionStore.lastOpenError = nil
+                              }
+                          }
+                      )
+                  ) {
+                      Button("确定", role: .cancel) {}
+                  } message: {
+                      Text(activeOpenErrorMessage ?? "")
+                  }
+                  #else
+                  .fileImporter(
+                      isPresented: $showFileImporter,
+                      allowedContentTypes: [.movie, .video, .audiovisualContent, .data],
+                      allowsMultipleSelection: false
+                  ) { result in
+                      if case .success(let urls) = result, let url = urls.first {
+                          openMedia(url: url)
+                      }
+                  }
+                  #endif"""
+          ps = ps.replace(t_fi, r_fi, 1)
+
+          t_btn = """    private var openFileButton: some View {
+                  Button(action: {
+                      showFileImporter = true
+                  }) {
+                      ZStack {
+                          Color.blue
+                          Text("打开文件")
+                              .font(.system(size: 15, weight: .semibold))
+                              .foregroundStyle(.white)
+                      }
+                      .frame(width: 240, height: 44)
+                      .modifier(
+                          GlassEffectModifier(
+                              cornerRadius: Self.openControlCornerRadius,
+                              useCapsule: true,
+                              clipsContent: true
+                          )
+                      )
+                  }
+                  .buttonStyle(.plain)
+              }"""
+          assert ps.count(t_btn) == 1, f"unexpected openFileButton block count: {ps.count(t_btn)}"
+          r_btn = """    private var openFileButton: some View {
+                  VStack(spacing: 12) {
+                      Button(action: {
+                          showFileImporter = true
+                      }) {
+                          ZStack {
+                              Color.blue
+                              Text("打开文件")
+                                  .font(.system(size: 15, weight: .semibold))
+                                  .foregroundStyle(.white)
+                          }
+                          .frame(width: 240, height: 44)
+                          .modifier(
+                              GlassEffectModifier(
+                                  cornerRadius: Self.openControlCornerRadius,
+                                  useCapsule: true,
+                                  clipsContent: true
+                              )
+                          )
+                      }
+                      .buttonStyle(.plain)
+
+                      #if os(iOS)
+                          PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                              ZStack {
+                                  Color.indigo
+                                  if isImportingPhoto {
+                                      HStack(spacing: 8) {
+                                          ProgressView()
+                                              .tint(.white)
+                                          Text("正在导入相册视频…")
+                                              .font(.system(size: 15, weight: .semibold))
+                                              .foregroundStyle(.white)
+                                      }
+                                  } else {
+                                      Label("从相册选择", systemImage: "photo.on.rectangle.angled")
+                                          .font(.system(size: 15, weight: .semibold))
+                                          .foregroundStyle(.white)
+                                  }
+                              }
+                              .frame(width: 240, height: 44)
+                              .modifier(
+                                  GlassEffectModifier(
+                                      cornerRadius: Self.openControlCornerRadius,
+                                      useCapsule: true,
+                                      clipsContent: true
+                                  )
+                              )
+                          }
+                          .buttonStyle(.plain)
+                          .disabled(isImportingPhoto)
+                      #endif
+                  }
+              }"""
+          ps = ps.replace(t_btn, r_btn, 1)
+
+          t_open = """    private func openMedia(url: URL) {
+                  #if os(tvOS)
+                      isURLFieldFocused = false
+                  #endif
+                  sessionStore.open(url: url)
+              }"""
+          assert ps.count(t_open) == 1, f"unexpected openMedia block count: {ps.count(t_open)}"
+          r_open = r"""    #if os(iOS)
+                  private var activeOpenErrorMessage: String? {
+                      openErrorMessage ?? sessionStore.lastOpenError
+                  }
+
+                  private func handlePendingPickedFile() {
+                      guard let pickedURL = pendingPickedURL else { return }
+                      pendingPickedURL = nil
+                      Task { @MainActor in
+                          try? await Task.sleep(for: .milliseconds(150))
+                          do {
+                              let stagedURL = try stageCinePlayerImportedFile(from: pickedURL)
+                              openMedia(url: stagedURL)
+                          } catch {
+                              openErrorMessage = "无法读取本地视频：\(error.localizedDescription)"
+                          }
+                      }
+                  }
+
+                  private func importFromPhotosItem(_ item: PhotosPickerItem) {
+                      guard !isImportingPhoto else { return }
+                      isImportingPhoto = true
+                      openErrorMessage = nil
+                      Task { @MainActor in
+                          defer { isImportingPhoto = false }
+                          do {
+                              guard let movie = try await item.loadTransferable(type: CinePlayerMovieTransferable.self) else {
+                                  openErrorMessage = "未能从系统相册读取该视频（请确认 iCloud 原片已下载到本地）。"
+                                  return
+                              }
+                              try? await Task.sleep(for: .milliseconds(150))
+                              openMedia(url: movie.url)
+                          } catch {
+                              openErrorMessage = "相册视频导入失败：\(error.localizedDescription)"
+                          }
+                      }
+                  }
+              #endif
+
+              private func openMedia(url: URL) {
+                  #if os(tvOS)
+                      isURLFieldFocused = false
+                  #endif
+                  sessionStore.open(url: url)
+              }"""
+          ps = ps.replace(t_open, r_open, 1)
+
+          ios_helpers = r"""
+
+          #if os(iOS)
+          private var cinePlayerImportsDirectory: URL {
+              FileManager.default.temporaryDirectory.appendingPathComponent("CinePlayerImports", isDirectory: true)
+          }
+
+          private func sanitizeCinePlayerFilename(_ raw: String) -> String {
+              let disallowed = CharacterSet(charactersIn: "/\\:#?%\"<>|*")
+              let joined = raw.components(separatedBy: disallowed).filter { !$0.isEmpty }.joined(separator: "_")
+              let trimmed = joined.trimmingCharacters(in: .whitespacesAndNewlines)
+              return trimmed.isEmpty ? "video" : String(trimmed.prefix(80))
+          }
+
+          private func pruneCinePlayerImports(keepingLatest limit: Int) {
+              guard let entries = try? FileManager.default.contentsOfDirectory(
+                  at: cinePlayerImportsDirectory,
+                  includingPropertiesForKeys: [.contentModificationDateKey],
+                  options: [.skipsHiddenFiles]
+              ), entries.count > limit else {
+                  return
+              }
+              let sorted = entries.sorted { lhs, rhs in
+                  let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                  let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                  return lDate > rDate
+              }
+              for obsolete in sorted.dropFirst(limit) {
+                  try? FileManager.default.removeItem(at: obsolete)
+              }
+          }
+
+          private func stageCinePlayerImportedFile(from sourceURL: URL) throws -> URL {
+              let standardizedImports = cinePlayerImportsDirectory.standardizedFileURL.path
+              if sourceURL.standardizedFileURL.path.hasPrefix(standardizedImports),
+                 FileManager.default.isReadableFile(atPath: sourceURL.path) {
+                  return sourceURL
+              }
+
+              try FileManager.default.createDirectory(at: cinePlayerImportsDirectory, withIntermediateDirectories: true)
+              pruneCinePlayerImports(keepingLatest: 3)
+
+              let didAccess = sourceURL.startAccessingSecurityScopedResource()
+              defer {
+                  if didAccess {
+                      sourceURL.stopAccessingSecurityScopedResource()
+                  }
+              }
+
+              let ext = sourceURL.pathExtension
+              let rawBase = sourceURL.deletingPathExtension().lastPathComponent
+              let sanitizedBase = sanitizeCinePlayerFilename(rawBase)
+              let prefix = String(UUID().uuidString.prefix(8))
+              let filename = ext.isEmpty ? "\(prefix)_\(sanitizedBase)" : "\(prefix)_\(sanitizedBase).\(ext)"
+              let destURL = cinePlayerImportsDirectory.appendingPathComponent(filename)
+
+              if FileManager.default.fileExists(atPath: destURL.path) {
+                  try FileManager.default.removeItem(at: destURL)
+              }
+
+              var coordinatorError: NSError?
+              var copyError: Error?
+              NSFileCoordinator().coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
+                  do {
+                      try FileManager.default.copyItem(at: readableURL, to: destURL)
+                  } catch {
+                      copyError = error
+                  }
+              }
+              if let coordinatorError {
+                  throw coordinatorError
+              }
+              if let copyError {
+                  throw copyError
+              }
+              guard FileManager.default.isReadableFile(atPath: destURL.path) else {
+                  throw NSError(
+                      domain: "CinePlayer.LocalImport",
+                      code: -1,
+                      userInfo: [NSLocalizedDescriptionKey: "导入后的视频副本不可读：\(destURL.lastPathComponent)"]
+                  )
+              }
+              return destURL
+          }
+
+          private struct IOSDocumentPickerView: UIViewControllerRepresentable {
+              let onPick: (URL) -> Void
+              let onCancel: () -> Void
+              let onError: (String) -> Void
+
+              func makeCoordinator() -> Coordinator {
+                  Coordinator(onPick: onPick, onCancel: onCancel, onError: onError)
+              }
+
+              func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+                  let picker = UIDocumentPickerViewController(
+                      forOpeningContentTypes: [.movie, .video, .audiovisualContent, .data],
+                      asCopy: true
+                  )
+                  picker.allowsMultipleSelection = false
+                  picker.shouldShowFileExtensions = true
+                  picker.delegate = context.coordinator
+                  return picker
+              }
+
+              func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
+                  context.coordinator.onPick = onPick
+                  context.coordinator.onCancel = onCancel
+                  context.coordinator.onError = onError
+              }
+
+              @MainActor
+              final class Coordinator: NSObject, UIDocumentPickerDelegate {
+                  var onPick: (URL) -> Void
+                  var onCancel: () -> Void
+                  var onError: (String) -> Void
+
+                  init(
+                      onPick: @escaping (URL) -> Void,
+                      onCancel: @escaping () -> Void,
+                      onError: @escaping (String) -> Void
+                  ) {
+                      self.onPick = onPick
+                      self.onCancel = onCancel
+                      self.onError = onError
+                  }
+
+                  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+                      guard let firstURL = urls.first else {
+                          onError("未获取到所选视频文件。")
+                          return
+                      }
+                      do {
+                          let stagedURL = try stageCinePlayerImportedFile(from: firstURL)
+                          onPick(stagedURL)
+                      } catch {
+                          onError("无法读取所选文件：\(error.localizedDescription)")
+                      }
+                  }
+
+                  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+                      onCancel()
+                  }
+              }
+          }
+
+          private struct CinePlayerMovieTransferable: Transferable, Sendable {
+              let url: URL
+
+              static var transferRepresentation: some TransferRepresentation {
+                  FileRepresentation(contentType: .movie) { movie in
+                      SentTransferredFile(movie.url)
+                  } importing: { received in
+                      let stagedURL = try stageCinePlayerImportedFile(from: received.file)
+                      return CinePlayerMovieTransferable(url: stagedURL)
+                  }
+
+                  FileRepresentation(contentType: .video) { movie in
+                      SentTransferredFile(movie.url)
+                  } importing: { received in
+                      let stagedURL = try stageCinePlayerImportedFile(from: received.file)
+                      return CinePlayerMovieTransferable(url: stagedURL)
+                  }
+              }
+          }
+          #endif
+          """
+          ps = ps.rstrip() + ios_helpers
           pov.write_text(ps, encoding="utf-8")
           print("Patched PlayerOpenView.swift")
 
           pss = pathlib.Path("CinePlayer/Player/Model/PlayerSessionStore.swift")
           ss = pss.read_text(encoding="utf-8")
+          t_pub = "    @Published var currentSource: PlayerSource?"
+          assert ss.count(t_pub) == 1, f"unexpected currentSource count: {ss.count(t_pub)}"
+          r_pub = "    @Published var currentSource: PlayerSource?\n    @Published var lastOpenError: String?"
+          ss = ss.replace(t_pub, r_pub, 1)
+
+          t_open_fn = """    func open(sources: [PlayerSource], startAt: Int = 0) {
+                  releaseSecurityScopedURLs()
+
+                  let preparedSources = prepareSourcesForPlayback(sources)
+                  guard !preparedSources.isEmpty else {
+                      close()
+                      return
+                  }"""
+          assert ss.count(t_open_fn) == 1, f"unexpected open(sources:) count: {ss.count(t_open_fn)}"
+          r_open_fn = r"""    func open(sources: [PlayerSource], startAt: Int = 0) {
+                  lastOpenError = nil
+                  releaseSecurityScopedURLs()
+
+                  let preparedSources = prepareSourcesForPlayback(sources)
+                  guard !preparedSources.isEmpty else {
+                      close()
+                      if let first = sources.first {
+                          lastOpenError = "无法读取视频文件：\(first.url.lastPathComponent)"
+                      }
+                      return
+                  }"""
+          ss = ss.replace(t_open_fn, r_open_fn, 1)
+
           t_sec = "\n".join([
             "            let hasSecurityAccess = fileURL.startAccessingSecurityScopedResource()",
             "            let isReadable =",
@@ -121,6 +533,7 @@ jobs:
             "            result.append(effectiveSource)",
           ])
           ss = ss.replace(t_sec, r_sec, 1)
+
           t_end = "    private func releaseSecurityScopedURLs() {"
           assert ss.count(t_end) == 1, f"unexpected releaseSecurityScopedURLs count: {ss.count(t_end)}"
           r_end = "\n".join([
