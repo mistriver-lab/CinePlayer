@@ -1,0 +1,63 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build CinePlayer iOS (Unsigned IPA)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select newest available Xcode
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          BEST_XCODE=$(python3 -c 'import glob,os,re; c=sorted(glob.glob("/Applications/Xcode*.app")); print(max(c, key=lambda p:(1 if re.findall(r"\d+",os.path.basename(p)) else 0, [int(x) for x in re.findall(r"\d+",os.path.basename(p))], os.path.basename(p))))')
+          echo "Selecting Xcode: $BEST_XCODE"
+          sudo xcode-select -s "$BEST_XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Download and verify v2.0.0 Frameworks.zip
+        run: |
+          curl --fail --location -O https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip
+          curl --fail --location -O https://github.com/cinemore/CinePlayer/releases/download/v2.0.0/Frameworks.zip.sha256
+          shasum -a 256 -c Frameworks.zip.sha256
+          unzip -q Frameworks.zip
+          ls -la Frameworks
+
+      - name: Resolve Swift Package dependencies
+        run: xcodebuild -resolvePackageDependencies -project CinePlayer.xcodeproj -scheme CinePlayer
+
+      - name: Build unsigned Release iOS app
+        run: |
+          xcodebuild \
+            -project CinePlayer.xcodeproj \
+            -scheme CinePlayer \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            SYMROOT="$PWD/build"
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Release-iphoneos/CinePlayer.app Payload/
+          ls -la Payload/CinePlayer.app/Frameworks || true
+          zip -qry "CinePlayer-v2.0.0-b${{ github.run_number }}-unsigned.ipa" Payload
+          ls -lh CinePlayer-v2.0.0-b*-unsigned.ipa
+
+      - name: Upload CinePlayer-unsigned-ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: CinePlayer-unsigned-ipa
+          path: CinePlayer-v*-unsigned.ipa
+          retention-days: 30
