@@ -48,6 +48,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     private var overloadSkipRemaining: Int = 0
     private var lastDiagLogNs: UInt64 = 0
     private var lastThermalWarnNs: UInt64 = 0
+    private var lockedThermalLevel: Int = 0
+    private var lastThermalAdjustNs: UInt64 = 0
     private var adaptiveDowngradeEnabled: Bool = true
     private static let perfWindowSize = 12
     private static let switchCooldownFrames = 20
@@ -55,8 +57,22 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     private static let overloadPassBudgetRatio = 1.8
     private static let overloadConsecutiveThreshold = 8
     private static let overloadCooldownFrames = 10
+    private static let seriousOverloadPassBudgetRatio = 1.5
+    private static let seriousOverloadConsecutiveThreshold = 5
+    private static let seriousOverloadCooldownFrames = 24
+    private static let thermalRecoveryHoldNs: UInt64 = 20_000_000_000
     private static let manualSevereBudgetRatio = 2.0
     private static let manualSevereConsecutiveThreshold = 6
+
+    private static func thermalLevel(for state: ProcessInfo.ThermalState) -> Int {
+        switch state {
+        case .nominal: 0
+        case .fair: 1
+        case .serious: 2
+        case .critical: 3
+        @unknown default: 0
+        }
+    }
 
     /// Enable / disable runtime auto-downgrade. Disabled when the user picks an
     /// explicit tier — their choice is honored unless severe overload occurs on iOS.
@@ -71,6 +87,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             overloadSkipRemaining = 0
             lastDiagLogNs = 0
             lastThermalWarnNs = 0
+            lockedThermalLevel = 0
+            lastThermalAdjustNs = 0
         }
     }
 
@@ -102,6 +120,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             overloadSkipRemaining = 0
             lastDiagLogNs = 0
             lastThermalWarnNs = 0
+            lockedThermalLevel = 0
+            lastThermalAdjustNs = 0
             #if targetEnvironment(simulator)
             didLogSimulatorFallback = false
             #endif
@@ -111,14 +131,23 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     nonisolated static func workingDimensions(
         sourceWidth: Int,
         sourceHeight: Int,
-        tier: RifeQualityTier
+        tier: RifeQualityTier,
+        thermalLevel: Int = 0
     ) -> (Int, Int) {
         #if os(iOS)
-        let maxLongEdge: Int
+        let baseLongEdge: Int
         switch tier {
-        case .fast: maxLongEdge = 1024
-        case .balanced: maxLongEdge = 1280
-        case .hq: maxLongEdge = 960
+        case .fast: baseLongEdge = 768
+        case .balanced: baseLongEdge = 1024
+        case .hq: baseLongEdge = 896
+        }
+        let maxLongEdge: Int
+        if thermalLevel >= 2 {
+            maxLongEdge = max(512, (Int(Double(baseLongEdge) * 0.70) / 32) * 32)
+        } else if thermalLevel == 1 {
+            maxLongEdge = max(640, (Int(Double(baseLongEdge) * 0.85) / 32) * 32)
+        } else {
+            maxLongEdge = baseLongEdge
         }
         let longEdge = max(sourceWidth, sourceHeight)
         guard longEdge > maxLongEdge, longEdge > 0 else {
@@ -143,10 +172,12 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
         let srcW = Int(dimensions.width)
         let srcH = Int(dimensions.height)
         guard srcW > 0, srcH > 0 else { return }
+        let initialThermalLevel = min(2, Self.thermalLevel(for: ProcessInfo.processInfo.thermalState))
         let (workW, workH) = Self.workingDimensions(
             sourceWidth: srcW,
             sourceHeight: srcH,
-            tier: tier
+            tier: tier,
+            thermalLevel: initialThermalLevel
         )
         await Task.detached(priority: .userInitiated) { [weak self] in
             self?.queue.sync {
@@ -162,20 +193,30 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     nonisolated func processTemporal(
         previous: PreviousVideoFrameSnapshot?,
         current: VideoFrameContext,
-        tier: RifeQualityTier
+        tier: RifeQualityTier,
+        targetFPS: InterpolationTargetFPS = .doubleSource,
+        screenMaxFPS: Int = 60
     ) -> VideoFrameResult {
         queue.sync {
             guard let previous, current.timestamp > previous.timestamp else {
                 return .passthrough
             }
-            return processTemporalOnQueue(previous: previous, current: current, tier: tier)
+            return processTemporalOnQueue(
+                previous: previous,
+                current: current,
+                tier: tier,
+                targetFPS: targetFPS,
+                screenMaxFPS: screenMaxFPS
+            )
         }
     }
 
     private func processTemporalOnQueue(
         previous: PreviousVideoFrameSnapshot,
         current: VideoFrameContext,
-        tier: RifeQualityTier
+        tier: RifeQualityTier,
+        targetFPS: InterpolationTargetFPS,
+        screenMaxFPS: Int
     ) -> VideoFrameResult {
         // autoreleasepool 强制 drain VT/CV 临时 IOSurface,避免 per-client 16384 配额上限。
         autoreleasepool {
@@ -193,7 +234,8 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 ])
             }
 
-            if ProcessInfo.processInfo.thermalState == .critical {
+            let thermalState = ProcessInfo.processInfo.thermalState
+            if thermalState == .critical {
                 let nowNs = DispatchTime.now().uptimeNanoseconds
                 if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
                     lastThermalWarnNs = nowNs
@@ -225,13 +267,32 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 overloadSkipRemaining = 0
                 lastDiagLogNs = 0
                 lastThermalWarnNs = 0
+                lockedThermalLevel = 0
+                lastThermalAdjustNs = 0
                 lastDims = dims
             }
+
+            let rawThermalLevel = min(2, Self.thermalLevel(for: thermalState))
+            if rawThermalLevel > lockedThermalLevel {
+                lockedThermalLevel = rawThermalLevel
+                lastThermalAdjustNs = totalStart
+                let label = rawThermalLevel >= 2 ? "偏热" : "温热"
+                EnhancementTelemetryCollector.shared.recordDowngrade(
+                    reason: "RIFE 设备\(label)，已动态降低推理分辨率"
+                )
+            } else if rawThermalLevel < lockedThermalLevel,
+                      totalStart &- lastThermalAdjustNs >= Self.thermalRecoveryHoldNs
+            {
+                lockedThermalLevel -= 1
+                lastThermalAdjustNs = totalStart
+            }
+
             let activeTier = effectiveTier ?? tier
             let (workW, workH) = Self.workingDimensions(
                 sourceWidth: width,
                 sourceHeight: height,
-                tier: activeTier
+                tier: activeTier,
+                thermalLevel: lockedThermalLevel
             )
             let needsScaling = (workW != width || workH != height)
 
@@ -246,30 +307,24 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             }
             let tAfterVT = DispatchTime.now().uptimeNanoseconds
 
-            guard let inferOutBuffer = needsScaling
-                ? ensureWorkOutputPool(width: workW, height: workH)
-                : ensureOutputPool(width: width, height: height) else {
-                cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool failed")
+            #if os(iOS)
+            let maxAllowed = (thermalState == .fair || thermalState == .serious) ? 1 : 2
+            #else
+            let maxAllowed = 3
+            #endif
+            var insertedCount = PlayerEnhancementModel.resolveInterpolatedFrameCount(
+                sourceFPS: Double(current.fps),
+                target: targetFPS,
+                screenMaxFPS: screenMaxFPS,
+                maxAllowedInsertedFrames: maxAllowed,
+                thermalState: thermalState
+            )
+            if insertedCount == 0 {
+                stream.reset()
                 return .passthrough
             }
-            if !needsScaling {
-                current.pixelBuffer.copyPropagatedAttachments(to: inferOutBuffer)
-            }
-            let tAfterPool = DispatchTime.now().uptimeNanoseconds
-
-            let didWriteMidframe: Bool
-            do {
-                didWriteMidframe = try stream.push(currBGRA, into: inferOutBuffer)
-            } catch {
-                cinemoreLog(level: .debug, "[VFI-RIFE] stream.push failed: \(error)")
-                return .passthrough
-            }
-            let tAfterInfer = DispatchTime.now().uptimeNanoseconds
-
-            if !didWriteMidframe {
-                // First push of this stream session: nothing to interpolate yet.
-                // Emit the current frame as a single-frame anchor (matches the
-                // segmentDur < 2 fallback below).
+            insertedCount = min(insertedCount, Int(segmentDur) - 1)
+            guard insertedCount > 0 else {
                 return .replaceMany([
                     GeneratedVideoFrame(pixelBuffer: current.pixelBuffer,
                                          timestamp: prevTs,
@@ -277,30 +332,124 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 ])
             }
 
-            let finalMidBuffer: CVPixelBuffer
-            if needsScaling {
-                guard let fullOutBuffer = ensureOutputPool(width: width, height: height) else {
-                    cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool (upscale) failed")
-                    return .passthrough
-                }
-                current.pixelBuffer.copyPropagatedAttachments(to: fullOutBuffer)
-                guard scaleBufferOnQueue(inferOutBuffer, into: fullOutBuffer) else {
-                    cinemoreLog(level: .debug, "[VFI-RIFE] upscale failed")
-                    return .passthrough
-                }
-                finalMidBuffer = fullOutBuffer
-            } else {
-                finalMidBuffer = inferOutBuffer
-            }
+            let tAfterPool: UInt64
+            let tAfterInfer: UInt64
+            let generated: [GeneratedVideoFrame]
 
-            // 两段 duration 严格相加 == segmentDur,否则时间轴错位。
-            let firstDuration = segmentDur / 2
-            let secondDuration = segmentDur - firstDuration
-            let midTs = prevTs + firstDuration
-            let generated: [GeneratedVideoFrame] = [
-                GeneratedVideoFrame(pixelBuffer: finalMidBuffer, timestamp: prevTs, duration: firstDuration),
-                GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: midTs, duration: secondDuration),
-            ]
+            if insertedCount == 1 {
+                guard let inferOutBuffer = needsScaling
+                    ? ensureWorkOutputPool(width: workW, height: workH)
+                    : ensureOutputPool(width: width, height: height) else {
+                    cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool failed")
+                    return .passthrough
+                }
+                if !needsScaling {
+                    current.pixelBuffer.copyPropagatedAttachments(to: inferOutBuffer)
+                }
+                tAfterPool = DispatchTime.now().uptimeNanoseconds
+
+                let didWriteMidframe: Bool
+                do {
+                    didWriteMidframe = try stream.push(currBGRA, into: inferOutBuffer)
+                } catch {
+                    cinemoreLog(level: .debug, "[VFI-RIFE] stream.push failed: \(error)")
+                    return .passthrough
+                }
+                tAfterInfer = DispatchTime.now().uptimeNanoseconds
+
+                if !didWriteMidframe {
+                    return .replaceMany([
+                        GeneratedVideoFrame(pixelBuffer: current.pixelBuffer,
+                                             timestamp: prevTs,
+                                             duration: segmentDur)
+                    ])
+                }
+
+                let finalMidBuffer: CVPixelBuffer
+                if needsScaling {
+                    guard let fullOutBuffer = ensureOutputPool(width: width, height: height) else {
+                        cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool (upscale) failed")
+                        return .passthrough
+                    }
+                    current.pixelBuffer.copyPropagatedAttachments(to: fullOutBuffer)
+                    guard scaleBufferOnQueue(inferOutBuffer, into: fullOutBuffer) else {
+                        cinemoreLog(level: .debug, "[VFI-RIFE] upscale failed")
+                        return .passthrough
+                    }
+                    finalMidBuffer = fullOutBuffer
+                } else {
+                    finalMidBuffer = inferOutBuffer
+                }
+
+                // 两段 duration 严格相加 == segmentDur,否则时间轴错位。
+                let firstDuration = segmentDur / 2
+                let secondDuration = segmentDur - firstDuration
+                let midTs = prevTs + firstDuration
+                generated = [
+                    GeneratedVideoFrame(pixelBuffer: finalMidBuffer, timestamp: prevTs, duration: firstDuration),
+                    GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: midTs, duration: secondDuration),
+                ]
+            } else {
+                tAfterPool = DispatchTime.now().uptimeNanoseconds
+                let timesteps = (1...insertedCount).map { Float($0) / Float(insertedCount + 1) }
+                let rawMids: [CVPixelBuffer]
+                do {
+                    rawMids = try stream.push(currBGRA, timesteps: timesteps)
+                } catch {
+                    cinemoreLog(level: .debug, "[VFI-RIFE] stream.push(timesteps:) failed: \(error)")
+                    return .passthrough
+                }
+                tAfterInfer = DispatchTime.now().uptimeNanoseconds
+
+                if rawMids.isEmpty {
+                    return .replaceMany([
+                        GeneratedVideoFrame(pixelBuffer: current.pixelBuffer,
+                                             timestamp: prevTs,
+                                             duration: segmentDur)
+                    ])
+                }
+
+                var finalMids: [CVPixelBuffer] = []
+                finalMids.reserveCapacity(rawMids.count)
+                for rawMid in rawMids {
+                    if needsScaling {
+                        guard let fullOutBuffer = ensureOutputPool(width: width, height: height) else {
+                            cinemoreLog(level: .debug, "[VFI-RIFE] ensureOutputPool (multi-upscale) failed")
+                            return .passthrough
+                        }
+                        current.pixelBuffer.copyPropagatedAttachments(to: fullOutBuffer)
+                        guard scaleBufferOnQueue(rawMid, into: fullOutBuffer) else {
+                            cinemoreLog(level: .debug, "[VFI-RIFE] multi-upscale failed")
+                            return .passthrough
+                        }
+                        finalMids.append(fullOutBuffer)
+                    } else {
+                        current.pixelBuffer.copyPropagatedAttachments(to: rawMid)
+                        finalMids.append(rawMid)
+                    }
+                }
+
+                let durations = PlayerEnhancementModel.splitSegmentDurations(
+                    totalDuration: segmentDur,
+                    segmentCount: finalMids.count + 1
+                )
+                var frames: [GeneratedVideoFrame] = []
+                frames.reserveCapacity(finalMids.count + 1)
+                var runningTs = prevTs
+                for (idx, midBuf) in finalMids.enumerated() {
+                    let dur = durations[idx]
+                    frames.append(GeneratedVideoFrame(pixelBuffer: midBuf, timestamp: runningTs, duration: dur))
+                    runningTs += dur
+                }
+                frames.append(
+                    GeneratedVideoFrame(
+                        pixelBuffer: current.pixelBuffer,
+                        timestamp: runningTs,
+                        duration: durations[finalMids.count]
+                    )
+                )
+                generated = frames
+            }
             let tEnd = DispatchTime.now().uptimeNanoseconds
             let totalMs = Double(tEnd - totalStart) / 1_000_000
             if lastDiagLogNs == 0 || tEnd &- lastDiagLogNs >= 1_000_000_000 {
@@ -317,7 +466,7 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                     " pool=\(String(format: "%.1f", poolMs))" +
                     " infer=\(String(format: "%.1f", inferMs))" +
                     " post=\(String(format: "%.1f", postMs)))" +
-                    " tier=\(activeTier.rawValue) src=\(width)x\(height) work=\(workW)x\(workH) thermal=\(thermal)"
+                    " tier=\(activeTier.rawValue) ins=\(insertedCount) src=\(width)x\(height) work=\(workW)x\(workH) thermal=\(thermal)"
                 )
             }
 
@@ -325,10 +474,19 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
 
             if adaptiveDowngradeEnabled, activeTier == .fast, current.fps > 0.5 {
                 let budgetMs = 1000.0 / Double(current.fps)
-                if totalMs > budgetMs * Self.overloadPassBudgetRatio {
+                let activeBudgetRatio = thermalState == .serious
+                    ? Self.seriousOverloadPassBudgetRatio
+                    : Self.overloadPassBudgetRatio
+                let activeConsecThreshold = thermalState == .serious
+                    ? Self.seriousOverloadConsecutiveThreshold
+                    : Self.overloadConsecutiveThreshold
+                let activeCooldownFrames = thermalState == .serious
+                    ? Self.seriousOverloadCooldownFrames
+                    : Self.overloadCooldownFrames
+                if totalMs > budgetMs * activeBudgetRatio {
                     consecutiveOverBudgetFrames += 1
-                    if consecutiveOverBudgetFrames >= Self.overloadConsecutiveThreshold {
-                        overloadSkipRemaining = Self.overloadCooldownFrames
+                    if consecutiveOverBudgetFrames >= activeConsecThreshold {
+                        overloadSkipRemaining = activeCooldownFrames
                         consecutiveOverBudgetFrames = 0
                         EnhancementTelemetryCollector.shared.recordDowngrade(
                             reason: "RIFE 极速档超负荷，短暂直通冷却"
@@ -563,16 +721,31 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
 nonisolated private final class RifeTemporalProcessor: VideoFrameProcessor, @unchecked Sendable {
     private let adapter: RifeFrameInterpolationAdapter
     private let tier: RifeQualityTier
+    private let targetFPS: InterpolationTargetFPS
+    private let screenMaxFPS: Int
     private let buffer = TemporalReorderBuffer()
 
-    init(adapter: RifeFrameInterpolationAdapter, tier: RifeQualityTier) {
+    init(
+        adapter: RifeFrameInterpolationAdapter,
+        tier: RifeQualityTier,
+        targetFPS: InterpolationTargetFPS,
+        screenMaxFPS: Int
+    ) {
         self.adapter = adapter
         self.tier = tier
+        self.targetFPS = targetFPS
+        self.screenMaxFPS = screenMaxFPS
     }
 
     func onFrame(_ ctx: VideoFrameContext) -> VideoFrameResult {
         buffer.accept(ctx) { previous, current in
-            adapter.processTemporal(previous: previous, current: current, tier: tier)
+            adapter.processTemporal(
+                previous: previous,
+                current: current,
+                tier: tier,
+                targetFPS: targetFPS,
+                screenMaxFPS: screenMaxFPS
+            )
         }
     }
 
@@ -596,8 +769,17 @@ nonisolated private final class RifeTemporalProcessor: VideoFrameProcessor, @unc
 }
 
 extension RifeFrameInterpolationAdapter {
-    nonisolated func makeTemporalProcessor(tier: RifeQualityTier) -> any VideoFrameProcessor {
-        RifeTemporalProcessor(adapter: self, tier: tier)
+    nonisolated func makeTemporalProcessor(
+        tier: RifeQualityTier,
+        targetFPS: InterpolationTargetFPS = .doubleSource,
+        screenMaxFPS: Int = 60
+    ) -> any VideoFrameProcessor {
+        RifeTemporalProcessor(
+            adapter: self,
+            tier: tier,
+            targetFPS: targetFPS,
+            screenMaxFPS: screenMaxFPS
+        )
     }
 }
 

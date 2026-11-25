@@ -485,12 +485,16 @@ struct PlayerControlView: View {
                                     let width = Int(size.width)
                                     let height = Int(size.height)
                                     let isHDR = track.dynamicRange != .sdr
+                                    let isDolbyVision = track.dynamicRange == .dolbyVision || track.dolbyVisionConfig != nil
+                                    let nominalFPS = Double(track.nominalFrameRate)
                                     if width > 0, height > 0 {
                                         PlayerEnhancementModel.shared
                                             .updateAvailabilityForCurrentVideo(
                                                 width: width,
                                                 height: height,
-                                                isHDR: isHDR
+                                                isHDR: isHDR,
+                                                isDolbyVision: isDolbyVision,
+                                                nominalFPS: nominalFPS
                                             )
                                     } else {
                                         PlayerEnhancementModel.shared

@@ -31,6 +31,11 @@ final class VideoPlayerModel: ObservableObject {
                         resetPipeline: resetPipeline)
                 }
             }
+            PlayerEnhancementModel.shared.onDynamicRangeReloadRequested = { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.reloadCurrentVideoForDynamicRangeChange()
+                }
+            }
         #endif
     }
 
@@ -40,6 +45,7 @@ final class VideoPlayerModel: ObservableObject {
 
         #if !os(tvOS)
             PlayerEnhancementModel.shared.resetVideoEnhancementForNewVideoSession()
+            newConfig.dynamicRange = PlayerEnhancementModel.shared.forceSDRForEnhancement ? .sdr : nil
         #endif
 
         newConfig.url = url
@@ -116,6 +122,28 @@ final class VideoPlayerModel: ObservableObject {
         options.onFrameCallbackEvent = callbackConfig.onFrameCallbackEvent
     }
 
+    #if !os(tvOS)
+        func reloadCurrentVideoForDynamicRangeChange() {
+            guard let url = sourceURL,
+                  let controller = playerCoordinator.controller
+            else {
+                return
+            }
+            let resumeTime = max(0, controller.currentPlaybackTime)
+            let newConfig = CinePlayerConfig()
+            newConfig.url = url
+            newConfig.startTime = resumeTime
+            newConfig.autoPlay = true
+            newConfig.dynamicRange = PlayerEnhancementModel.shared.forceSDRForEnhancement ? .sdr : nil
+            newConfig.subtitleStyle = config.subtitleStyle
+            newConfig.subtitleTranslateMode = config.subtitleTranslateMode
+            newConfig.subtitleTranslate = config.subtitleTranslate
+            configureFrameCallback(for: newConfig)
+            controller.replace(config: newConfig)
+            config = newConfig
+        }
+    #endif
+
     /// 热更新当前活跃播放器的帧回调配置。
     func applyFrameCallbackConfigurationToActivePlayer(resetPipeline: Bool) {
         guard let controller = playerCoordinator.controller else {
@@ -149,6 +177,9 @@ final class VideoPlayerModel: ObservableObject {
             let enhancementModel = PlayerEnhancementModel.shared
             let strategy: VideoEnhancementStrategy
             strategy = enhancementModel.videoEnhancementStrategy
+            let targetFPS = enhancementModel.interpolationTargetFPS
+            let screenMaxFPS = enhancementModel.currentScreenMaxFPS
+            let targetFPSDetail = targetFPS.shortDetail(screenMaxFPS: screenMaxFPS)
 
             cinemoreLog(
                 level: .debug,
@@ -280,14 +311,14 @@ final class VideoPlayerModel: ObservableObject {
                     let onEvent = makeFrameCallbackEventLogger(tag: "VFI")
                     if frameInterpolationEnabled {
                         let scalar = 1
-                        let numFrames = max(
-                            1, min(3, enhancementModel.systemMLInterpolatedFrames))
+                        let warmupNumFrames = max(
+                            1, min(3, enhancementModel.resolvedSystemMLInterpolatedFrames))
                         logFrameCallbackConfigurationOnce(
-                            "System VT frame interpolation enabled mode=temporal scalar=\(scalar) numFrames=\(numFrames)"
+                            "System VT frame interpolation enabled mode=temporal scalar=\(scalar) targetFPS=\(targetFPS.rawValue) screenMaxFPS=\(screenMaxFPS) warmupNumFrames=\(warmupNumFrames)"
                         )
                         EnhancementTelemetryCollector.shared.reset(
                             strategy: "systemML-fi",
-                            detail: "+\(numFrames)f"
+                            detail: targetFPSDetail
                         )
                         policy = FrameCallbackPolicy(
                             enabled: true,
@@ -297,7 +328,8 @@ final class VideoPlayerModel: ObservableObject {
                                         InstrumentedVideoFrameProcessor(
                                             inner: adapter.makeTemporalProcessor(
                                                 scalar: scalar,
-                                                numFrames: numFrames
+                                                targetFPS: targetFPS,
+                                                screenMaxFPS: screenMaxFPS
                                             )
                                         )
                                     },
@@ -305,7 +337,7 @@ final class VideoPlayerModel: ObservableObject {
                                         await adapter.warmup(
                                             dimensions: dims,
                                             scalar: scalar,
-                                            numFrames: numFrames
+                                            numFrames: warmupNumFrames
                                         )
                                     }
                                 )
@@ -354,10 +386,10 @@ final class VideoPlayerModel: ObservableObject {
                     return (policy, nil)
                 }
                 logFrameCallbackConfigurationOnce(
-                    "Optical flow frame callback enabled mode=temporal")
+                    "Optical flow frame callback enabled mode=temporal targetFPS=\(targetFPS.rawValue) screenMaxFPS=\(screenMaxFPS)")
                 EnhancementTelemetryCollector.shared.reset(
                     strategy: "opticalFlow",
-                    detail: "2x"
+                    detail: targetFPSDetail
                 )
                 let adapter = OpticalFlowFrameInterpolationAdapter.shared
                 policy = FrameCallbackPolicy(
@@ -366,7 +398,10 @@ final class VideoPlayerModel: ObservableObject {
                         .init(
                             processorFactory: {
                                 InstrumentedVideoFrameProcessor(
-                                    inner: adapter.makeTemporalProcessor()
+                                    inner: adapter.makeTemporalProcessor(
+                                        targetFPS: targetFPS,
+                                        screenMaxFPS: screenMaxFPS
+                                    )
                                 )
                             },
                             warmup: { dims in
@@ -406,10 +441,10 @@ final class VideoPlayerModel: ObservableObject {
                     }
                 }
                 logFrameCallbackConfigurationOnce(
-                    "RIFE frame callback enabled mode=temporal tier=\(tier.rawValue) adaptive=\(adaptive)")
+                    "RIFE frame callback enabled mode=temporal tier=\(tier.rawValue) adaptive=\(adaptive) targetFPS=\(targetFPS.rawValue) screenMaxFPS=\(screenMaxFPS)")
                 EnhancementTelemetryCollector.shared.reset(
                     strategy: "rife",
-                    detail: tier.rawValue
+                    detail: "\(tier.rawValue)·\(targetFPSDetail)"
                 )
                 policy = FrameCallbackPolicy(
                     enabled: true,
@@ -417,7 +452,11 @@ final class VideoPlayerModel: ObservableObject {
                         .init(
                             processorFactory: {
                                 InstrumentedVideoFrameProcessor(
-                                    inner: adapter.makeTemporalProcessor(tier: tier)
+                                    inner: adapter.makeTemporalProcessor(
+                                        tier: tier,
+                                        targetFPS: targetFPS,
+                                        screenMaxFPS: screenMaxFPS
+                                    )
                                 )
                             },
                             warmup: { dims in await adapter.warmup(dimensions: dims, tier: tier) }

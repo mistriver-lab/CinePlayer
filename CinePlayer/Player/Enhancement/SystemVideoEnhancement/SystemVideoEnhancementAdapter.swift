@@ -18,6 +18,7 @@
         private var temporalRecv = 0
         private var temporalHit = 0
         private var temporalPassthrough = 0
+        private var lastThermalWarnNs: UInt64 = 0
 
         private func vfiLog(level: CinemoreLogLevel, _ message: String) {
             cinemoreLog(level: level, "[VFI-ML] \(message)")
@@ -77,6 +78,7 @@
                 clearTemporalPreviousCache()
                 resetSuperResolutionSessionOnQueue()
                 resetLLFISessionOnQueue()
+                lastThermalWarnNs = 0
             }
         }
 
@@ -175,7 +177,8 @@
             previous: PreviousVideoFrameSnapshot?,
             current: VideoFrameContext,
             scalar: Int,
-            numFrames: Int
+            targetFPS: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS: Int = 60
         ) -> VideoFrameResult {
             queue.sync {
                 temporalRecv += 1
@@ -211,7 +214,7 @@
                     vfiTemporalStatsLogMaybe(
                         seq: seq,
                         scalar: scalar,
-                        numFrames: numFrames,
+                        numFrames: 0,
                         prevTs: previous.timestamp,
                         currTs: current.timestamp,
                         size: "\(w)x\(h)",
@@ -233,7 +236,7 @@
                     vfiTemporalStatsLogMaybe(
                         seq: seq,
                         scalar: scalar,
-                        numFrames: numFrames,
+                        numFrames: 0,
                         prevTs: prevTs,
                         currTs: currTs,
                         size: "\(w)x\(h)",
@@ -244,6 +247,41 @@
                     )
                     return .passthrough
                 }
+
+                let thermalState = ProcessInfo.processInfo.thermalState
+                if thermalState == .critical {
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
+                        lastThermalWarnNs = nowNs
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "VT 插帧设备过热，已切直通"
+                        )
+                    }
+                    temporalPassthrough += 1
+                    return .passthrough
+                }
+
+                let resolved = PlayerEnhancementModel.resolveInterpolatedFrameCount(
+                    sourceFPS: Double(current.fps),
+                    target: targetFPS,
+                    screenMaxFPS: screenMaxFPS,
+                    maxAllowedInsertedFrames: scalar == 2 ? 1 : 3,
+                    thermalState: thermalState
+                )
+                guard resolved > 0 else {
+                    temporalPassthrough += 1
+                    return .passthrough
+                }
+                if thermalState == .serious {
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 10_000_000_000 {
+                        lastThermalWarnNs = nowNs
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "VT 插帧设备偏热，已自动限幅为 2×"
+                        )
+                    }
+                }
+                let numFrames = scalar == 2 ? 1 : min(3, max(1, resolved))
 
                 let width = CVPixelBufferGetWidth(current.pixelBuffer)
                 let height = CVPixelBufferGetHeight(current.pixelBuffer)
@@ -1341,17 +1379,20 @@
     {
         private let adapter: SystemVideoEnhancementAdapter
         private let scalar: Int
-        private let numFrames: Int
+        private let targetFPS: InterpolationTargetFPS
+        private let screenMaxFPS: Int
         private let buffer = TemporalReorderBuffer()
 
         init(
             adapter: SystemVideoEnhancementAdapter,
             scalar: Int,
-            numFrames: Int
+            targetFPS: InterpolationTargetFPS,
+            screenMaxFPS: Int
         ) {
             self.adapter = adapter
             self.scalar = scalar
-            self.numFrames = numFrames
+            self.targetFPS = targetFPS
+            self.screenMaxFPS = screenMaxFPS
         }
 
         func onFrame(_ ctx: VideoFrameContext) -> VideoFrameResult {
@@ -1360,7 +1401,8 @@
                     previous: previous,
                     current: current,
                     scalar: scalar,
-                    numFrames: numFrames
+                    targetFPS: targetFPS,
+                    screenMaxFPS: screenMaxFPS
                 )
             }
         }
@@ -1387,12 +1429,14 @@
     extension SystemVideoEnhancementAdapter {
         nonisolated func makeTemporalProcessor(
             scalar: Int,
-            numFrames: Int
+            targetFPS: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS: Int = 60
         ) -> any VideoFrameProcessor {
             SystemVideoEnhancementTemporalProcessor(
                 adapter: self,
                 scalar: scalar,
-                numFrames: numFrames
+                targetFPS: targetFPS,
+                screenMaxFPS: screenMaxFPS
             )
         }
     }
@@ -1515,7 +1559,8 @@
             previous _: PreviousVideoFrameSnapshot?,
             current _: VideoFrameContext,
             scalar _: Int,
-            numFrames _: Int
+            targetFPS _: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS _: Int = 60
         ) -> VideoFrameResult {
             .passthrough
         }
@@ -1524,7 +1569,8 @@
 
         nonisolated func makeTemporalProcessor(
             scalar _: Int,
-            numFrames _: Int
+            targetFPS _: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS _: Int = 60
         ) -> any VideoFrameProcessor {
             SystemVideoEnhancementTemporalProcessor()
         }

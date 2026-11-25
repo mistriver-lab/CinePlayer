@@ -102,8 +102,29 @@ struct SiderEnhancementView: View {
                 }
 
                 Section(
+                    header: Text("动态范围与兼容性"),
+                    footer: Text("杜比视界（DV）在原生直通播放时系统解码管线会跳过外部滤镜与补帧回调；开启此项将从当前进度重载为 SDR 管线以启用全链路超分与补帧。")
+                ) {
+                    Toggle("转 SDR 启用全链路增强", isOn: $enhancementModel.forceSDRForEnhancement)
+
+                    if enhancementModel.currentVideoIsDolbyVision && !enhancementModel.forceSDRForEnhancement {
+                        Text("当前为杜比视界直通播放：原生解码管线会跳过外部滤镜/补帧回调。开启上方开关将从当前进度重载为 SDR 管线，解锁全部超分与补帧。")
+                            .font(.subheadline)
+                            .foregroundStyle(.orange)
+                    } else if enhancementModel.currentVideoIsHDR && !enhancementModel.currentVideoIsDolbyVision && !enhancementModel.forceSDRForEnhancement {
+                        Text("当前为 HDR 片源，RIFE 需转为 SDR 管线后方可启用；开启上方开关将从当前进度重载为 SDR。")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else if enhancementModel.forceSDRForEnhancement {
+                        Text("已强制 SDR 管线输出，全部超分与补帧增强均已解锁。")
+                            .font(.subheadline)
+                            .foregroundStyle(.green)
+                    }
+                }
+
+                Section(
                     header: Text("RIFE 补帧"),
-                    footer: Text("Apple 原生 ML 补帧（4K 以内，仅 SDR）。iOS 端 4K 片源将自动采用高速工作分辨率推理并硬件放大，超负荷时自动降档保护；与光流补帧互斥。")
+                    footer: Text("iOS 端推荐优先使用硬件加速的 VT 插帧，功耗与控温表现更佳；RIFE 负载较高，4K 或发热时会自动动态缩边与降档保护；与光流补帧互斥。")
                 ) {
                     let isAvailable = enhancementModel.rifeSectionVisible
 
@@ -115,9 +136,9 @@ struct SiderEnhancementView: View {
                             },
                             set: { newValue in
                                 if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .rife
+                                    enhancementModel.setStrategy(.rife)
                                 } else if enhancementModel.videoEnhancementStrategy == .rife {
-                                    enhancementModel.videoEnhancementStrategy = .off
+                                    enhancementModel.setStrategy(.off)
                                 }
                             }
                         )
@@ -125,9 +146,15 @@ struct SiderEnhancementView: View {
                     .disabled(!isAvailable)
 
                     if !isAvailable {
-                        Text("当前视频不在 RIFE 支持范围（最大 4K，仅 SDR）")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        if enhancementModel.currentVideoIsHDR && !enhancementModel.forceSDRForEnhancement {
+                            Text("当前为 HDR/杜比视界视频，请先开启上方「转 SDR 启用全链路增强」以解锁 RIFE")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("当前视频不在 RIFE 支持范围（最大 4K，仅 SDR）")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         if enhancementModel.videoEnhancementStrategy == .rife {
                             Picker("档位", selection: $enhancementModel.rifeTierPreference) {
@@ -140,6 +167,7 @@ struct SiderEnhancementView: View {
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
+                            interpolationTargetFPSPicker
                         }
                         if let rifeURL = URL(string: "https://github.com/hzwer/Practical-RIFE") {
                             Link("了解 RIFE 详情", destination: rifeURL)
@@ -162,13 +190,9 @@ struct SiderEnhancementView: View {
                             },
                             set: { newValue in
                                 if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .anime4k
-                                    enhancementModel.anime4kEnabled = true
-                                } else {
-                                    enhancementModel.anime4kEnabled = false
-                                    if enhancementModel.videoEnhancementStrategy == .anime4k {
-                                        enhancementModel.videoEnhancementStrategy = .off
-                                    }
+                                    enhancementModel.setStrategy(.anime4k)
+                                } else if enhancementModel.videoEnhancementStrategy == .anime4k {
+                                    enhancementModel.setStrategy(.off)
                                 }
                             }
                         )
@@ -232,13 +256,9 @@ struct SiderEnhancementView: View {
                             },
                             set: { newValue in
                                 if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .metalFX
-                                    enhancementModel.metalFXSuperResolutionEnabled = true
-                                } else {
-                                    enhancementModel.metalFXSuperResolutionEnabled = false
-                                    if enhancementModel.videoEnhancementStrategy == .metalFX {
-                                        enhancementModel.videoEnhancementStrategy = .off
-                                    }
+                                    enhancementModel.setStrategy(.metalFX)
+                                } else if enhancementModel.videoEnhancementStrategy == .metalFX {
+                                    enhancementModel.setStrategy(.off)
                                 }
                             }
                         )
@@ -292,18 +312,7 @@ struct SiderEnhancementView: View {
                                     && enhancementModel.systemMLSuperResolutionEnabled
                             },
                             set: { newValue in
-                                if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .systemML
-                                    enhancementModel.systemMLSuperResolutionEnabled = true
-                                    enhancementModel.systemMLFrameInterpolationEnabled = false
-                                } else {
-                                    enhancementModel.systemMLSuperResolutionEnabled = false
-                                    if enhancementModel.videoEnhancementStrategy == .systemML,
-                                       !enhancementModel.systemMLFrameInterpolationEnabled
-                                    {
-                                        enhancementModel.videoEnhancementStrategy = .off
-                                    }
-                                }
+                                enhancementModel.setSystemMLEnhancement(superResolution: newValue)
                             }
                         )
                     )
@@ -354,18 +363,7 @@ struct SiderEnhancementView: View {
                                     && enhancementModel.systemMLFrameInterpolationEnabled
                             },
                             set: { newValue in
-                                if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .systemML
-                                    enhancementModel.systemMLFrameInterpolationEnabled = true
-                                    enhancementModel.systemMLSuperResolutionEnabled = false
-                                } else {
-                                    enhancementModel.systemMLFrameInterpolationEnabled = false
-                                    if enhancementModel.videoEnhancementStrategy == .systemML,
-                                       !enhancementModel.systemMLSuperResolutionEnabled
-                                    {
-                                        enhancementModel.videoEnhancementStrategy = .off
-                                    }
-                                }
+                                enhancementModel.setSystemMLEnhancement(frameInterpolation: newValue)
                             }
                         )
                     )
@@ -373,14 +371,10 @@ struct SiderEnhancementView: View {
 
                     if fiAvailable {
                         if enhancementModel.systemMLFrameInterpolationEnabled {
-                            Picker(
-                                "Frames added",
-                                selection: $enhancementModel.systemMLInterpolatedFrames
-                            ) {
-                                Text("1").tag(1)
-                                Text("2").tag(2)
-                                Text("3").tag(3)
-                            }
+                            interpolationTargetFPSPicker
+                            Text("当前自动插入 \(enhancementModel.resolvedSystemMLInterpolatedFrames) 帧（设备偏热时自动限幅为 2×）")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
                     } else if !enhancementModel.systemMLEnhancementSupported {
                         Text("当前设备不支持 VT 插帧")
@@ -407,9 +401,9 @@ struct SiderEnhancementView: View {
                             },
                             set: { newValue in
                                 if newValue {
-                                    enhancementModel.videoEnhancementStrategy = .opticalFlow
+                                    enhancementModel.setStrategy(.opticalFlow)
                                 } else if enhancementModel.videoEnhancementStrategy == .opticalFlow {
-                                    enhancementModel.videoEnhancementStrategy = .off
+                                    enhancementModel.setStrategy(.off)
                                 }
                             }
                         )
@@ -420,6 +414,8 @@ struct SiderEnhancementView: View {
                         Text("当前视频分辨率不在光流补帧支持范围内")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                    } else if enhancementModel.videoEnhancementStrategy == .opticalFlow {
+                        interpolationTargetFPSPicker
                     }
                 }
 
@@ -449,6 +445,19 @@ struct SiderEnhancementView: View {
                 videoSummary: currentVideoSummary,
                 statsSummary: enhancementModel.liveStatsSummaryText
             )
+        }
+    }
+
+    @ViewBuilder
+    private var interpolationTargetFPSPicker: some View {
+        Picker("目标帧率", selection: $enhancementModel.interpolationTargetFPS) {
+            ForEach(InterpolationTargetFPS.allCases) { target in
+                if target == .matchScreen {
+                    Text("\(target.displayName)（\(enhancementModel.currentScreenMaxFPS) fps）").tag(target)
+                } else {
+                    Text(target.displayName).tag(target)
+                }
+            }
         }
     }
 

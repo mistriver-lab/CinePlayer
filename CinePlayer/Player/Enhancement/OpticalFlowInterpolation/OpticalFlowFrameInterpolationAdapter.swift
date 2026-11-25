@@ -31,24 +31,40 @@
         private var poolKey: (Int, Int)?
         private var transferSession: VTPixelTransferSession?
 
-        static func targetSize(width: Int, height: Int) -> (Int, Int) {
+        static func targetSize(
+            width: Int,
+            height: Int,
+            thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+        ) -> (Int, Int) {
+            let maxLong: Double
+            let maxShort: Double
+            if thermalState == .serious || thermalState == .critical {
+                maxLong = 480.0
+                maxShort = 270.0
+            } else {
+                maxLong = 640.0
+                maxShort = 360.0
+            }
             let longSide = max(width, height)
             let shortSide = min(width, height)
-            if longSide <= 640 && shortSide <= 360 {
+            if Double(longSide) <= maxLong && Double(shortSide) <= maxShort {
                 return (width, height)
             }
-            let scale = min(640.0 / Double(longSide), 360.0 / Double(shortSide))
+            let scale = min(maxLong / Double(longSide), maxShort / Double(shortSide))
             let scaledW = max(16, (Int(Double(width) * scale) / 2) * 2)
             let scaledH = max(16, (Int(Double(height) * scale) / 2) * 2)
             return (scaledW, scaledH)
         }
 
-        func downscaleIfNeeded(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+        func downscaleIfNeeded(
+            _ buffer: CVPixelBuffer,
+            thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+        ) -> CVPixelBuffer? {
             let srcW = CVPixelBufferGetWidth(buffer)
             let srcH = CVPixelBufferGetHeight(buffer)
             guard srcW > 0, srcH > 0 else { return nil }
 
-            let (dstW, dstH) = Self.targetSize(width: srcW, height: srcH)
+            let (dstW, dstH) = Self.targetSize(width: srcW, height: srcH, thermalState: thermalState)
             let pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
             if srcW == dstW, srcH == dstH, pixelFormat == kCVPixelFormatType_32BGRA {
                 return buffer
@@ -270,10 +286,12 @@
             }.value
         }
 
-        /// 时域插帧：根据 prev/curr 生成 [插值帧, 当前帧]，覆盖 [prevTs, currTs)。previous 由 Center 填充；为 nil 直接 passthrough（Center 走兜底保形）。
+        /// 时域插帧：根据 prev/curr 生成 [插值帧..., 当前帧]，覆盖 [prevTs, currTs)。previous 由 Center 填充；为 nil 直接 passthrough（Center 走兜底保形）。
         nonisolated func processTemporal(
             previous: PreviousVideoFrameSnapshot?,
-            current: VideoFrameContext
+            current: VideoFrameContext,
+            targetFPS: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS: Int = 60
         ) -> VideoFrameResult {
             queue.sync {
                 guard let previous else {
@@ -282,7 +300,12 @@
                 guard current.timestamp > previous.timestamp else {
                     return .passthrough
                 }
-                return processTemporalOnQueue(previous: previous, current: current)
+                return processTemporalOnQueue(
+                    previous: previous,
+                    current: current,
+                    targetFPS: targetFPS,
+                    screenMaxFPS: screenMaxFPS
+                )
             }
         }
 
@@ -317,7 +340,9 @@
 
         private func processTemporalOnQueue(
             previous: PreviousVideoFrameSnapshot,
-            current: VideoFrameContext
+            current: VideoFrameContext,
+            targetFPS: InterpolationTargetFPS,
+            screenMaxFPS: Int
         ) -> VideoFrameResult {
             // 每帧用 autoreleasepool 包裹:Swift + GCD queue.sync 不会自动 drain Obj-C autorelease pool,
             // Metal/Vision/VTPixelTransfer 产生的临时 IOSurface 引用会累积到 per-client 16384 配额触顶。
@@ -339,7 +364,8 @@
                     return .replaceMany(generated)
                 }
 
-                if ProcessInfo.processInfo.thermalState == .critical {
+                let thermalState = ProcessInfo.processInfo.thermalState
+                if thermalState == .critical {
                     let nowNs = DispatchTime.now().uptimeNanoseconds
                     if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
                         lastThermalWarnNs = nowNs
@@ -349,6 +375,24 @@
                     }
                     return .passthrough
                 }
+
+                var insertedCount = PlayerEnhancementModel.resolveInterpolatedFrameCount(
+                    sourceFPS: Double(current.fps),
+                    target: targetFPS,
+                    screenMaxFPS: screenMaxFPS,
+                    maxAllowedInsertedFrames: 3,
+                    thermalState: thermalState
+                )
+                if insertedCount == 0 {
+                    return .passthrough
+                }
+                let maxByDuration = Int(min(Int64(insertedCount), segmentDur - 1))
+                if maxByDuration < 1 {
+                    return .replaceMany([
+                        GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: prevTs, duration: segmentDur),
+                    ])
+                }
+                insertedCount = maxByDuration
 
                 let width = CVPixelBufferGetWidth(current.pixelBuffer)
                 let height = CVPixelBufferGetHeight(current.pixelBuffer)
@@ -396,11 +440,6 @@
                 }
                 let visionMs = Double(DispatchTime.now().uptimeNanoseconds - visionStart) / 1_000_000
 
-                guard let outBuffer = ensureOutputPool(width: width, height: height) else {
-                    return .passthrough
-                }
-                current.pixelBuffer.copyPropagatedAttachments(to: outBuffer)
-
                 let fwdFlowW = CVPixelBufferGetWidth(flowPair.forwardFlow)
                 let fwdFlowH = CVPixelBufferGetHeight(flowPair.forwardFlow)
                 let bwdFlowW = CVPixelBufferGetWidth(flowPair.backwardFlow)
@@ -414,11 +453,24 @@
                 let secondTex = makeTextureFromPixelBuffer(secondBGRA, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm)
                 let forwardFlowTex = makeTextureFromFlowBuffer(flowPair.forwardFlow, textureCache: cache, width: fwdFlowW, height: fwdFlowH)
                 let backwardFlowTex = makeTextureFromFlowBuffer(flowPair.backwardFlow, textureCache: cache, width: bwdFlowW, height: bwdFlowH)
-                let outTex = makeTextureFromPixelBuffer(outBuffer, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm)
 
-                guard let firstTex, let secondTex, let forwardFlowTex, let backwardFlowTex, let outTex else {
+                guard let firstTex, let secondTex, let forwardFlowTex, let backwardFlowTex else {
                     cinemoreLog(level: .debug, "[VFI-OF] texture create failed")
                     return .passthrough
+                }
+
+                var outputs: [(CVPixelBuffer, MTLTexture)] = []
+                outputs.reserveCapacity(insertedCount)
+                for _ in 0..<insertedCount {
+                    guard let outBuffer = ensureOutputPool(width: width, height: height) else {
+                        return .passthrough
+                    }
+                    current.pixelBuffer.copyPropagatedAttachments(to: outBuffer)
+                    guard let outTex = makeTextureFromPixelBuffer(outBuffer, textureCache: cache, width: width, height: height, pixelFormat: .bgra8Unorm) else {
+                        cinemoreLog(level: .debug, "[VFI-OF] output texture create failed")
+                        return .passthrough
+                    }
+                    outputs.append((outBuffer, outTex))
                 }
 
                 guard let cmdBuffer = commandQueue.makeCommandBuffer(),
@@ -427,14 +479,11 @@
                     return .passthrough
                 }
 
-                var params = OpticalFlowFusedParams(t: 0.5, flowErrorPivot: Self.flowErrorPivot)
                 encoder.setComputePipelineState(fusedPipeline)
                 encoder.setTexture(firstTex, index: 0)
                 encoder.setTexture(secondTex, index: 1)
                 encoder.setTexture(forwardFlowTex, index: 2)
                 encoder.setTexture(backwardFlowTex, index: 3)
-                encoder.setTexture(outTex, index: 4)
-                encoder.setBytes(&params, length: MemoryLayout<OpticalFlowFusedParams>.stride, index: 0)
 
                 let tw = fusedPipeline.threadExecutionWidth
                 let th = min(16, max(1, fusedPipeline.maxTotalThreadsPerThreadgroup / tw))
@@ -443,7 +492,15 @@
                     height: (height + th - 1) / th,
                     depth: 1
                 )
-                encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
+                let threadsPerGroup = MTLSize(width: tw, height: th, depth: 1)
+
+                for (idx, (_, outTex)) in outputs.enumerated() {
+                    let t = Float(idx + 1) / Float(insertedCount + 1)
+                    var params = OpticalFlowFusedParams(t: t, flowErrorPivot: Self.flowErrorPivot)
+                    encoder.setTexture(outTex, index: 4)
+                    encoder.setBytes(&params, length: MemoryLayout<OpticalFlowFusedParams>.stride, index: 0)
+                    encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threadsPerGroup)
+                }
 
                 encoder.endEncoding()
                 cmdBuffer.commit()
@@ -453,15 +510,25 @@
                     return .passthrough
                 }
 
-                // 两段 duration 必须严格相加等于 (currTs - prevTs),否则 buildTemporalFramesFromGenerated 校验失败或时间轴错位导致抖动。
-                // segmentDur >= 2 的前提在函数开头已保证。
-                let firstDuration = segmentDur / 2
-                let secondDuration = segmentDur - firstDuration
-                let midTs = prevTs + firstDuration
-                let generated: [GeneratedVideoFrame] = [
-                    GeneratedVideoFrame(pixelBuffer: outBuffer, timestamp: prevTs, duration: firstDuration),
-                    GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: midTs, duration: secondDuration),
-                ]
+                let durations = PlayerEnhancementModel.splitSegmentDurations(
+                    totalDuration: segmentDur,
+                    segmentCount: insertedCount + 1
+                )
+                var generated: [GeneratedVideoFrame] = []
+                generated.reserveCapacity(insertedCount + 1)
+                var runningTs = prevTs
+                for idx in 0..<insertedCount {
+                    let dur = durations[idx]
+                    generated.append(
+                        GeneratedVideoFrame(pixelBuffer: outputs[idx].0, timestamp: runningTs, duration: dur)
+                    )
+                    runningTs += dur
+                }
+                let lastDur = durations[insertedCount]
+                generated.append(
+                    GeneratedVideoFrame(pixelBuffer: current.pixelBuffer, timestamp: runningTs, duration: lastDur)
+                )
+
                 let nowNs = DispatchTime.now().uptimeNanoseconds
                 if lastDiagLogNs == 0 || nowNs &- lastDiagLogNs >= 1_000_000_000 {
                     lastDiagLogNs = nowNs
@@ -471,7 +538,7 @@
                     let thermal = DiagnosticLogStore.currentThermalStateText()
                     cinemoreLog(
                         level: .debug,
-                        "[VFI-OF] diag total=\(String(format: "%.1f", totalMs))ms vision2x=\(String(format: "%.1f", visionMs))ms metal=\(String(format: "%.1f", metalMs))ms flow=\(fwdFlowW)x\(fwdFlowH) out=\(width)x\(height) hit=\(cacheHits)/\(totalLookups) thermal=\(thermal)"
+                        "[VFI-OF] diag total=\(String(format: "%.1f", totalMs))ms vision2x=\(String(format: "%.1f", visionMs))ms metal=\(String(format: "%.1f", metalMs))ms ins=\(insertedCount) flow=\(fwdFlowW)x\(fwdFlowH) out=\(width)x\(height) hit=\(cacheHits)/\(totalLookups) thermal=\(thermal)"
                     )
                 }
                 return .replaceMany(generated)
@@ -661,9 +728,10 @@
         ) -> OpticalFlowPair? {
             let origW = CVPixelBufferGetWidth(source)
             let origH = CVPixelBufferGetHeight(source)
+            let thermalState = ProcessInfo.processInfo.thermalState
             guard origW > 0, origH > 0,
-                  let smallSrc = flowDownscaler.downscaleIfNeeded(source),
-                  let smallDst = flowDownscaler.downscaleIfNeeded(target)
+                  let smallSrc = flowDownscaler.downscaleIfNeeded(source, thermalState: thermalState),
+                  let smallDst = flowDownscaler.downscaleIfNeeded(target, thermalState: thermalState)
             else {
                 cinemoreLog(level: .debug, "[VFI-OF] downscale for optical flow failed")
                 return nil
@@ -672,7 +740,8 @@
                 source: smallSrc,
                 target: smallDst,
                 originalWidth: origW,
-                originalHeight: origH
+                originalHeight: origH,
+                thermalState: thermalState
             ) else {
                 cinemoreLog(level: .debug, "[VFI-OF] forward flow failed")
                 return nil
@@ -681,7 +750,8 @@
                 source: smallDst,
                 target: smallSrc,
                 originalWidth: origW,
-                originalHeight: origH
+                originalHeight: origH,
+                thermalState: thermalState
             ) else {
                 cinemoreLog(level: .debug, "[VFI-OF] backward flow failed")
                 return nil
@@ -694,7 +764,8 @@
             source: CVPixelBuffer,
             target: CVPixelBuffer,
             originalWidth: Int,
-            originalHeight: Int
+            originalHeight: Int,
+            thermalState: ProcessInfo.ThermalState
         ) -> CVPixelBuffer? {
             // autoreleasepool 强制 drain Vision 内部临时 IOSurface；
             // 否则 Swift + GCD queue.sync 不会在 block 结束时 drain Obj-C autorelease pool，
@@ -702,12 +773,13 @@
             autoreleasepool {
                 let request = VNGenerateOpticalFlowRequest(targetedCVPixelBuffer: target, orientation: .up)
                 request.revision = VNGenerateOpticalFlowRequestRevision1
+                let isHot = thermalState == .serious || thermalState == .critical
                 #if os(iOS)
-                    request.computationAccuracy = min(originalWidth, originalHeight) > 540 ? .low : .medium
+                    request.computationAccuracy = (isHot || min(originalWidth, originalHeight) > 540) ? .low : .medium
                 #else
                     _ = originalWidth
                     _ = originalHeight
-                    request.computationAccuracy = .medium
+                    request.computationAccuracy = isHot ? .low : .medium
                 #endif
                 let handler = VNImageRequestHandler(cvPixelBuffer: source, options: [:])
                 do {
@@ -775,10 +847,18 @@
 
     nonisolated private final class OpticalFlowTemporalProcessor: VideoFrameProcessor, @unchecked Sendable {
         private let adapter: OpticalFlowFrameInterpolationAdapter
+        private let targetFPS: InterpolationTargetFPS
+        private let screenMaxFPS: Int
         private let buffer = TemporalReorderBuffer()
 
-        init(adapter: OpticalFlowFrameInterpolationAdapter) {
+        init(
+            adapter: OpticalFlowFrameInterpolationAdapter,
+            targetFPS: InterpolationTargetFPS,
+            screenMaxFPS: Int
+        ) {
             self.adapter = adapter
+            self.targetFPS = targetFPS
+            self.screenMaxFPS = screenMaxFPS
         }
 
         func onFrame(_ ctx: VideoFrameContext) -> VideoFrameResult {
@@ -792,8 +872,13 @@
                         generation: next.generation
                     )
                 },
-                buildSegment: { [adapter] previous, current in
-                    adapter.processTemporal(previous: previous, current: current)
+                buildSegment: { [adapter, targetFPS, screenMaxFPS] previous, current in
+                    adapter.processTemporal(
+                        previous: previous,
+                        current: current,
+                        targetFPS: targetFPS,
+                        screenMaxFPS: screenMaxFPS
+                    )
                 }
             )
         }
@@ -818,8 +903,15 @@
     }
 
     extension OpticalFlowFrameInterpolationAdapter {
-        nonisolated func makeTemporalProcessor() -> any VideoFrameProcessor {
-            OpticalFlowTemporalProcessor(adapter: self)
+        nonisolated func makeTemporalProcessor(
+            targetFPS: InterpolationTargetFPS = .doubleSource,
+            screenMaxFPS: Int = 60
+        ) -> any VideoFrameProcessor {
+            OpticalFlowTemporalProcessor(
+                adapter: self,
+                targetFPS: targetFPS,
+                screenMaxFPS: screenMaxFPS
+            )
         }
     }
 #endif

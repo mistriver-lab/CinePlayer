@@ -9,6 +9,9 @@ import CoreVideo
 import Metal
 import os
 import RifeMetal
+#if canImport(UIKit)
+import UIKit
+#endif
 #if canImport(MetalFX)
 @preconcurrency import MetalFX
 #endif
@@ -482,11 +485,48 @@ nonisolated enum MetalFXOutputResolution: String, CaseIterable, Identifiable {
     }
 }
 
+nonisolated enum InterpolationTargetFPS: String, CaseIterable, Identifiable, Sendable {
+    case doubleSource = "2x"
+    case fps60 = "60"
+    case fps120 = "120"
+    case matchScreen = "screen"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .doubleSource: "原帧 2×"
+        case .fps60: "60 fps"
+        case .fps120: "120 fps"
+        case .matchScreen: "匹配屏幕刷新率"
+        }
+    }
+
+    func shortDetail(screenMaxFPS: Int) -> String {
+        switch self {
+        case .doubleSource: "2x"
+        case .fps60: "60fps"
+        case .fps120: "120fps"
+        case .matchScreen: "\(max(60, screenMaxFPS))fps"
+        }
+    }
+
+    func resolvedTargetFPS(screenMaxFPS: Int) -> Double? {
+        switch self {
+        case .doubleSource: nil
+        case .fps60: 60.0
+        case .fps120: 120.0
+        case .matchScreen: Double(max(60, screenMaxFPS))
+        }
+    }
+}
+
 @MainActor
 final class PlayerEnhancementModel: ObservableObject {
     static let shared = PlayerEnhancementModel()
 
     var onRuntimeConfigChanged: ((Bool) -> Void)?
+    var onDynamicRangeReloadRequested: (() -> Void)?
     private var suppressRuntimeCallback = true
 
     private init() {
@@ -524,6 +564,11 @@ final class PlayerEnhancementModel: ObservableObject {
             defaultValue: false
         )
         rifeTierPreference = Self.loadRifeTierPreference()
+        forceSDRForEnhancement = Self.loadBool(
+            forKey: StorageKey.forceSDRForEnhancement,
+            defaultValue: false
+        )
+        interpolationTargetFPS = Self.loadInterpolationTargetFPS()
         suppressRuntimeCallback = false
     }
 
@@ -531,6 +576,43 @@ final class PlayerEnhancementModel: ObservableObject {
     @Published var opticalFlowSectionVisible: Bool = false
     @Published var metalFXSectionVisible: Bool = false
     @Published var rifeSectionVisible: Bool = false
+    @Published var currentVideoIsHDR: Bool = false
+    @Published var currentVideoIsDolbyVision: Bool = false
+    @Published var currentVideoNominalFPS: Double = 0
+    @Published var forceSDRForEnhancement: Bool = false {
+        didSet {
+            UserDefaults.standard.set(
+                forceSDRForEnhancement,
+                forKey: StorageKey.forceSDRForEnhancement
+            )
+            if let width = systemMLCurrentVideoWidth,
+               let height = systemMLCurrentVideoHeight,
+               width > 0, height > 0
+            {
+                rifeSectionVisible = (!currentVideoIsHDR || forceSDRForEnhancement)
+                    && Self.isVideoResolutionInRifeRange(width: width, height: height)
+                let clamped = clampStrategyToAvailability(videoEnhancementStrategy)
+                if clamped != videoEnhancementStrategy {
+                    let prev = suppressRuntimeCallback
+                    suppressRuntimeCallback = true
+                    videoEnhancementStrategy = clamped
+                    suppressRuntimeCallback = prev
+                }
+            }
+            if !suppressRuntimeCallback {
+                onDynamicRangeReloadRequested?()
+            }
+        }
+    }
+    @Published var interpolationTargetFPS: InterpolationTargetFPS = .doubleSource {
+        didSet {
+            UserDefaults.standard.set(
+                interpolationTargetFPS.rawValue,
+                forKey: StorageKey.interpolationTargetFPS
+            )
+            notifyRuntimeConfigChanged(resetPipeline: true)
+        }
+    }
     @Published var liveStats: EnhancementLiveStats = .idle
     @Published var rifeTierPreference: RifeTierPreference = .auto {
         didSet {
@@ -759,12 +841,43 @@ final class PlayerEnhancementModel: ObservableObject {
         )
     }
 
-    func updateAvailabilityForCurrentVideo(width: Int?, height: Int?, isHDR: Bool = false) {
+    var currentScreenMaxFPS: Int {
+        #if os(iOS)
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?
+            .screen
+            .maximumFramesPerSecond ?? 60
+        #else
+        return 120
+        #endif
+    }
+
+    var resolvedSystemMLInterpolatedFrames: Int {
+        let count = Self.resolveInterpolatedFrameCount(
+            sourceFPS: currentVideoNominalFPS,
+            target: interpolationTargetFPS,
+            screenMaxFPS: currentScreenMaxFPS,
+            maxAllowedInsertedFrames: 3
+        )
+        return max(1, count)
+    }
+
+    func updateAvailabilityForCurrentVideo(
+        width: Int?,
+        height: Int?,
+        isHDR: Bool = false,
+        isDolbyVision: Bool = false,
+        nominalFPS: Double = 0
+    ) {
         guard let width, let height, width > 0, height > 0 else {
             anime4kSectionVisible = false
             opticalFlowSectionVisible = false
             metalFXSectionVisible = false
             rifeSectionVisible = false
+            currentVideoIsHDR = false
+            currentVideoIsDolbyVision = false
+            currentVideoNominalFPS = 0
             systemMLCurrentVideoInRange = false
             setSystemMLCurrentVideoDimensions(width: nil, height: nil)
             if videoEnhancementStrategy != .off {
@@ -773,6 +886,9 @@ final class PlayerEnhancementModel: ObservableObject {
             return
         }
 
+        currentVideoIsHDR = isHDR
+        currentVideoIsDolbyVision = isDolbyVision
+        currentVideoNominalFPS = nominalFPS
         anime4kSectionVisible = Self.isVideoPixelCountInAnime4KRange(width: width, height: height)
         opticalFlowSectionVisible = Self.isVideoResolutionInOpticalFlowRange(width: width, height: height)
         systemMLCurrentVideoInRange = Self.isVideoResolutionInSystemMLRange(width: width, height: height)
@@ -780,16 +896,48 @@ final class PlayerEnhancementModel: ObservableObject {
         metalFXSectionVisible =
             metalFXSuperResolutionSupported
             && Self.isVideoResolutionInMetalFXRange(width: width, height: height)
-        // RIFE pipeline is BGRA8 end-to-end; HDR sources would be tonemapped to SDR
-        // and lose their dynamic range. Block the toggle entirely on HDR videos
-        // rather than silently downgrading.
-        rifeSectionVisible = !isHDR && Self.isVideoResolutionInRifeRange(width: width, height: height)
+        // RIFE pipeline is BGRA8 end-to-end; HDR sources require forced SDR reload
+        // before RIFE can run without losing dynamic range unexpectedly.
+        rifeSectionVisible = (!isHDR || forceSDRForEnhancement)
+            && Self.isVideoResolutionInRifeRange(width: width, height: height)
         clampMetalFXOutputResolutionToCurrentVideoIfNeeded()
 
         let clamped = clampStrategyToAvailability(videoEnhancementStrategy)
         if clamped != videoEnhancementStrategy {
             videoEnhancementStrategy = clamped
         }
+    }
+
+    func setStrategy(_ strategy: VideoEnhancementStrategy) {
+        let prev = suppressRuntimeCallback
+        suppressRuntimeCallback = true
+        videoEnhancementStrategy = strategy
+        suppressRuntimeCallback = prev
+        notifyRuntimeConfigChanged(resetPipeline: true)
+    }
+
+    func setSystemMLEnhancement(superResolution: Bool? = nil, frameInterpolation: Bool? = nil) {
+        let prev = suppressRuntimeCallback
+        suppressRuntimeCallback = true
+        if let superResolution {
+            systemMLSuperResolutionEnabled = superResolution
+            if superResolution {
+                systemMLFrameInterpolationEnabled = false
+            }
+        }
+        if let frameInterpolation {
+            systemMLFrameInterpolationEnabled = frameInterpolation
+            if frameInterpolation {
+                systemMLSuperResolutionEnabled = false
+            }
+        }
+        if systemMLSuperResolutionEnabled || systemMLFrameInterpolationEnabled {
+            videoEnhancementStrategy = .systemML
+        } else if videoEnhancementStrategy == .systemML {
+            videoEnhancementStrategy = .off
+        }
+        suppressRuntimeCallback = prev
+        notifyRuntimeConfigChanged(resetPipeline: true)
     }
 
     func setSystemMLCurrentVideoDimensions(width: Int?, height: Int?) {
@@ -815,6 +963,9 @@ final class PlayerEnhancementModel: ObservableObject {
         opticalFlowSectionVisible = false
         metalFXSectionVisible = false
         rifeSectionVisible = false
+        currentVideoIsHDR = false
+        currentVideoIsDolbyVision = false
+        currentVideoNominalFPS = 0
         currentRifeTier = nil
         systemMLCurrentVideoWidth = nil
         systemMLCurrentVideoHeight = nil
@@ -839,7 +990,56 @@ final class PlayerEnhancementModel: ObservableObject {
         guard width > 0, height > 0 else {
             return false
         }
-        return width * height < anime4KMaxInputPixels
+        return width * height <= anime4KMaxInputPixels
+    }
+
+    nonisolated static func resolveInterpolatedFrameCount(
+        sourceFPS: Double,
+        target: InterpolationTargetFPS,
+        screenMaxFPS: Int,
+        maxAllowedInsertedFrames: Int,
+        thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+    ) -> Int {
+        guard maxAllowedInsertedFrames > 0 else { return 0 }
+        if thermalState == .critical {
+            return 0
+        }
+        let thermalCap: Int
+        switch thermalState {
+        case .serious:
+            thermalCap = 1
+        case .fair:
+            thermalCap = min(maxAllowedInsertedFrames, 2)
+        default:
+            thermalCap = maxAllowedInsertedFrames
+        }
+
+        if target == .doubleSource {
+            return min(thermalCap, 1)
+        }
+        let desiredFPS = target.resolvedTargetFPS(screenMaxFPS: screenMaxFPS) ?? 60.0
+        if sourceFPS <= 0.5 {
+            return min(thermalCap, 1)
+        }
+        if sourceFPS >= desiredFPS - 1.0 {
+            return 0
+        }
+        let multiplier = Int(ceil(desiredFPS / sourceFPS))
+        let needed = max(1, multiplier - 1)
+        return min(thermalCap, needed)
+    }
+
+    nonisolated static func splitSegmentDurations(totalDuration: Int64, segmentCount: Int) -> [Int64] {
+        guard segmentCount > 0 else { return [] }
+        let count64 = Int64(segmentCount)
+        let base = totalDuration / count64
+        let rem = Int(totalDuration % count64)
+        var result: [Int64] = []
+        result.reserveCapacity(segmentCount)
+        for idx in 0..<segmentCount {
+            result.append(base + (idx < rem ? 1 : 0))
+        }
+        return result
     }
 
     static func isVideoResolutionInOpticalFlowRange(width: Int, height: Int) -> Bool {
@@ -1007,6 +1207,13 @@ final class PlayerEnhancementModel: ObservableObject {
         static let metalFXOutputResolution = "metalFXOutputResolution"
         static let metalFXABCompare = "metalFXABCompare"
         static let rifeTierPreference = "rifeTierPreference"
+        static let forceSDRForEnhancement = "forceSDRForEnhancement"
+        static let interpolationTargetFPS = "interpolationTargetFPS"
+    }
+
+    private static func loadInterpolationTargetFPS() -> InterpolationTargetFPS {
+        let raw = UserDefaults.standard.string(forKey: StorageKey.interpolationTargetFPS)
+        return InterpolationTargetFPS(rawValue: raw ?? InterpolationTargetFPS.doubleSource.rawValue) ?? .doubleSource
     }
 
     private static func loadRifeTierPreference() -> RifeTierPreference {
@@ -1062,6 +1269,10 @@ final class PlayerEnhancementModel: ObservableObject {
     }
 
     private func applyMutualExclusion(for strategy: VideoEnhancementStrategy) {
+        let previousSuppress = suppressRuntimeCallback
+        suppressRuntimeCallback = true
+        defer { suppressRuntimeCallback = previousSuppress }
+
         switch strategy {
         case .anime4k:
             metalFXSuperResolutionEnabled = false
