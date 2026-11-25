@@ -51,13 +51,16 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
     private var lockedThermalLevel: Int = 0
     private var lastThermalAdjustNs: UInt64 = 0
     private var adaptiveDowngradeEnabled: Bool = true
+    private var dynamicMaxInsertedFrames: Int? = nil
+    private var multiFrameOverBudgetCount: Int = 0
+    private var lastTargetFPS: InterpolationTargetFPS? = nil
     private static let perfWindowSize = 12
     private static let switchCooldownFrames = 20
     private static let downgradeBudgetRatio = 0.9 // p90 > 0.9 × budget triggers downgrade
-    private static let overloadPassBudgetRatio = 1.8
-    private static let overloadConsecutiveThreshold = 8
+    private static let overloadPassBudgetRatio = 1.35
+    private static let overloadConsecutiveThreshold = 6
     private static let overloadCooldownFrames = 10
-    private static let seriousOverloadPassBudgetRatio = 1.5
+    private static let seriousOverloadPassBudgetRatio = 1.20
     private static let seriousOverloadConsecutiveThreshold = 5
     private static let seriousOverloadCooldownFrames = 24
     private static let thermalRecoveryHoldNs: UInt64 = 20_000_000_000
@@ -89,6 +92,9 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             lastThermalWarnNs = 0
             lockedThermalLevel = 0
             lastThermalAdjustNs = 0
+            dynamicMaxInsertedFrames = nil
+            multiFrameOverBudgetCount = 0
+            lastTargetFPS = nil
         }
     }
 
@@ -122,6 +128,9 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             lastThermalWarnNs = 0
             lockedThermalLevel = 0
             lastThermalAdjustNs = 0
+            dynamicMaxInsertedFrames = nil
+            multiFrameOverBudgetCount = 0
+            lastTargetFPS = nil
             #if targetEnvironment(simulator)
             didLogSimulatorFallback = false
             #endif
@@ -132,22 +141,25 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
         sourceWidth: Int,
         sourceHeight: Int,
         tier: RifeQualityTier,
-        thermalLevel: Int = 0
+        thermalLevel: Int = 0,
+        insertedCount: Int = 1
     ) -> (Int, Int) {
         #if os(iOS)
         let baseLongEdge: Int
         switch tier {
-        case .fast: baseLongEdge = 768
-        case .balanced: baseLongEdge = 1024
+        case .fast: baseLongEdge = 640
+        case .balanced: baseLongEdge = 896
         case .hq: baseLongEdge = 896
         }
+        let multiScale = insertedCount >= 2 ? 0.80 : 1.0
+        let scaledBase = max(448, (Int(Double(baseLongEdge) * multiScale) / 32) * 32)
         let maxLongEdge: Int
         if thermalLevel >= 2 {
-            maxLongEdge = max(512, (Int(Double(baseLongEdge) * 0.70) / 32) * 32)
+            maxLongEdge = max(416, (Int(Double(scaledBase) * 0.75) / 32) * 32)
         } else if thermalLevel == 1 {
-            maxLongEdge = max(640, (Int(Double(baseLongEdge) * 0.85) / 32) * 32)
+            maxLongEdge = max(448, (Int(Double(scaledBase) * 0.85) / 32) * 32)
         } else {
-            maxLongEdge = baseLongEdge
+            maxLongEdge = scaledBase
         }
         let longEdge = max(sourceWidth, sourceHeight)
         guard longEdge > maxLongEdge, longEdge > 0 else {
@@ -269,7 +281,14 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 lastThermalWarnNs = 0
                 lockedThermalLevel = 0
                 lastThermalAdjustNs = 0
+                dynamicMaxInsertedFrames = nil
+                multiFrameOverBudgetCount = 0
+                lastTargetFPS = targetFPS
                 lastDims = dims
+            } else if lastTargetFPS != targetFPS {
+                dynamicMaxInsertedFrames = nil
+                multiFrameOverBudgetCount = 0
+                lastTargetFPS = targetFPS
             }
 
             let rawThermalLevel = min(2, Self.thermalLevel(for: thermalState))
@@ -287,12 +306,39 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 lastThermalAdjustNs = totalStart
             }
 
+            #if os(iOS)
+            let baseMaxAllowed = (thermalState == .fair || thermalState == .serious) ? 1 : 2
+            #else
+            let baseMaxAllowed = 3
+            #endif
+            let effectiveMaxAllowed = dynamicMaxInsertedFrames.map { min(baseMaxAllowed, $0) } ?? baseMaxAllowed
+            var insertedCount = PlayerEnhancementModel.resolveInterpolatedFrameCount(
+                sourceFPS: Double(current.fps),
+                target: targetFPS,
+                screenMaxFPS: screenMaxFPS,
+                maxAllowedInsertedFrames: effectiveMaxAllowed,
+                thermalState: thermalState
+            )
+            if insertedCount == 0 {
+                stream?.reset()
+                return .passthrough
+            }
+            insertedCount = min(insertedCount, Int(segmentDur) - 1)
+            guard insertedCount > 0 else {
+                return .replaceMany([
+                    GeneratedVideoFrame(pixelBuffer: current.pixelBuffer,
+                                         timestamp: prevTs,
+                                         duration: segmentDur)
+                ])
+            }
+
             let activeTier = effectiveTier ?? tier
             let (workW, workH) = Self.workingDimensions(
                 sourceWidth: width,
                 sourceHeight: height,
                 tier: activeTier,
-                thermalLevel: lockedThermalLevel
+                thermalLevel: lockedThermalLevel,
+                insertedCount: insertedCount
             )
             let needsScaling = (workW != width || workH != height)
 
@@ -306,31 +352,6 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
                 return .passthrough
             }
             let tAfterVT = DispatchTime.now().uptimeNanoseconds
-
-            #if os(iOS)
-            let maxAllowed = (thermalState == .fair || thermalState == .serious) ? 1 : 2
-            #else
-            let maxAllowed = 3
-            #endif
-            var insertedCount = PlayerEnhancementModel.resolveInterpolatedFrameCount(
-                sourceFPS: Double(current.fps),
-                target: targetFPS,
-                screenMaxFPS: screenMaxFPS,
-                maxAllowedInsertedFrames: maxAllowed,
-                thermalState: thermalState
-            )
-            if insertedCount == 0 {
-                stream.reset()
-                return .passthrough
-            }
-            insertedCount = min(insertedCount, Int(segmentDur) - 1)
-            guard insertedCount > 0 else {
-                return .replaceMany([
-                    GeneratedVideoFrame(pixelBuffer: current.pixelBuffer,
-                                         timestamp: prevTs,
-                                         duration: segmentDur)
-                ])
-            }
 
             let tAfterPool: UInt64
             let tAfterInfer: UInt64
@@ -471,6 +492,24 @@ nonisolated final class RifeFrameInterpolationAdapter: @unchecked Sendable {
             }
 
             adaptTierIfNeededOnQueue(elapsedMs: totalMs, fps: current.fps, currentTier: activeTier)
+
+            if insertedCount > 1, current.fps > 0.5 {
+                let budgetMs = 1000.0 / Double(current.fps)
+                if totalMs > budgetMs * 0.90 {
+                    multiFrameOverBudgetCount += 1
+                    if multiFrameOverBudgetCount >= 6 {
+                        dynamicMaxInsertedFrames = max(1, insertedCount - 1)
+                        multiFrameOverBudgetCount = 0
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "RIFE \(insertedCount + 1)× 超出帧预算(\(Int(totalMs))ms)，已稳帧为 \(insertedCount)×"
+                        )
+                    }
+                } else {
+                    multiFrameOverBudgetCount = 0
+                }
+            } else {
+                multiFrameOverBudgetCount = 0
+            }
 
             if adaptiveDowngradeEnabled, activeTier == .fast, current.fps > 0.5 {
                 let budgetMs = 1000.0 / Double(current.fps)

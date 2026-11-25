@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-ios:
-    name: Build GlassMPV iOS v1.2.0 (Unsigned IPA)
+    name: Build GlassMPV iOS (Date-Versioned Unsigned IPA)
     runs-on: macos-latest
 
     steps:
@@ -298,6 +298,10 @@ jobs:
       - name: Build unsigned Release iOS app
         run: |
           set -euo pipefail
+          DATE_VER=$(TZ=Asia/Shanghai date +%Y.%m.%d)
+          BUILD_TIME=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
+          echo "DATE_VER=$DATE_VER" >> "$GITHUB_ENV"
+          echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
           xcodebuild \
             -project CinePlayer.xcodeproj \
             -scheme CinePlayer \
@@ -305,6 +309,8 @@ jobs:
             -destination "generic/platform=iOS" \
             -skipPackagePluginValidation \
             -skipMacroValidation \
+            MARKETING_VERSION="$DATE_VER" \
+            CURRENT_PROJECT_VERSION="$BUILD_TIME" \
             DEVELOPMENT_TEAM="" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -326,8 +332,9 @@ jobs:
           ls -la Payload/CinePlayer.app/Frameworks || true
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/CinePlayer.app/Info.plist
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Payload/CinePlayer.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Payload/CinePlayer.app/Info.plist
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" Payload/CinePlayer.app/Info.plist
-          IPA_NAME="GlassMPV-v1.2.0-b${{ github.run_number }}-unsigned.ipa"
+          IPA_NAME="GlassMPV-${DATE_VER}-${BUILD_TIME}-unsigned.ipa"
           zip -qry "$IPA_NAME" Payload
           ls -lh "$IPA_NAME"
 
@@ -335,5 +342,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: GlassMPV-unsigned-ipa
-          path: GlassMPV-v1.2.0-b*-unsigned.ipa
+          path: GlassMPV-*-unsigned.ipa
           retention-days: 30

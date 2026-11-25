@@ -69,6 +69,10 @@
         private var llfiInputDimensions: CMVideoDimensions?
         private var llfiScalar: Int = 1
         private var llfiNumFrames: Int = 1
+        private var llfiConsecutiveFailures: Int = 0
+        private var llfiCooldownUntilNs: UInt64 = 0
+        private var llfiForcedMaxFrames: Int? = nil
+        private var llfiLastDimsForCircuit: (Int, Int)? = nil
         /// 播放器不再传上一帧时，由适配器自行缓存；无缓存时先拷贝当前帧再回传，下一帧即可用缓存做 previous。
         private var cachedPreviousForTemporal: (snapshot: PreviousVideoFrameSnapshot, generation: Int64)?
 
@@ -79,6 +83,10 @@
                 resetSuperResolutionSessionOnQueue()
                 resetLLFISessionOnQueue()
                 lastThermalWarnNs = 0
+                llfiConsecutiveFailures = 0
+                llfiCooldownUntilNs = 0
+                llfiForcedMaxFrames = nil
+                llfiLastDimsForCircuit = nil
             }
         }
 
@@ -248,9 +256,23 @@
                     return .passthrough
                 }
 
+                let width = CVPixelBufferGetWidth(current.pixelBuffer)
+                let height = CVPixelBufferGetHeight(current.pixelBuffer)
+                if llfiLastDimsForCircuit.map({ $0.0 != width || $0.1 != height }) ?? true {
+                    llfiConsecutiveFailures = 0
+                    llfiCooldownUntilNs = 0
+                    llfiForcedMaxFrames = nil
+                    llfiLastDimsForCircuit = (width, height)
+                }
+
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if llfiCooldownUntilNs > nowNs {
+                    temporalPassthrough += 1
+                    return .passthrough
+                }
+
                 let thermalState = ProcessInfo.processInfo.thermalState
                 if thermalState == .critical {
-                    let nowNs = DispatchTime.now().uptimeNanoseconds
                     if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 5_000_000_000 {
                         lastThermalWarnNs = nowNs
                         EnhancementTelemetryCollector.shared.recordDowngrade(
@@ -261,11 +283,13 @@
                     return .passthrough
                 }
 
+                let baseMax = scalar == 2 ? 1 : 3
+                let cappedMax = llfiForcedMaxFrames.map { min(baseMax, $0) } ?? baseMax
                 let resolved = PlayerEnhancementModel.resolveInterpolatedFrameCount(
                     sourceFPS: Double(current.fps),
                     target: targetFPS,
                     screenMaxFPS: screenMaxFPS,
-                    maxAllowedInsertedFrames: scalar == 2 ? 1 : 3,
+                    maxAllowedInsertedFrames: cappedMax,
                     thermalState: thermalState
                 )
                 guard resolved > 0 else {
@@ -273,7 +297,6 @@
                     return .passthrough
                 }
                 if thermalState == .serious {
-                    let nowNs = DispatchTime.now().uptimeNanoseconds
                     if lastThermalWarnNs == 0 || nowNs &- lastThermalWarnNs >= 10_000_000_000 {
                         lastThermalWarnNs = nowNs
                         EnhancementTelemetryCollector.shared.recordDowngrade(
@@ -281,10 +304,8 @@
                         )
                     }
                 }
-                let numFrames = scalar == 2 ? 1 : min(3, max(1, resolved))
+                let numFrames = min(cappedMax, max(1, resolved))
 
-                let width = CVPixelBufferGetWidth(current.pixelBuffer)
-                let height = CVPixelBufferGetHeight(current.pixelBuffer)
                 let dims = CMVideoDimensions(width: Int32(width), height: Int32(height))
                 guard
                     let pool = ensureLLFISessionIfNeeded(
@@ -419,30 +440,12 @@
                 )
                 holder.runCollect()
 
-                var waitResult = holder.semaphore.wait(timeout: .now() + .seconds(2))
-                var framesToUse = holder.frames
-                var collectError = holder.error
-                var retryHolder: LLFICollectorHolder?
-
-                if let err = collectError, err.localizedDescription.contains("not initialized") {
-                    vfiLog(level: .debug, "temporal processor not initialized; wait and retry once")
-                    usleep(30000)
-                    let holder2 = LLFICollectorHolder(
-                        processor: processor,
-                        parameters: parameters,
-                        copyPool: copyPool,
-                        copyTransferSession: copySession
-                    )
-                    retryHolder = holder2
-                    holder2.runCollect()
-                    waitResult = holder2.semaphore.wait(timeout: .now() + .seconds(2))
-                    framesToUse = holder2.frames
-                    collectError = holder2.error
-                }
+                let waitResult = holder.semaphore.wait(timeout: .now() + .seconds(2))
+                let framesToUse = holder.frames
+                let collectError = holder.error
 
                 if waitResult == .timedOut {
                     holder.cancel()
-                    retryHolder?.cancel()
                     resetLLFISessionOnQueue()
                     vfiLog(level: .debug, "temporal failed: VT process timeout (2s)")
                     temporalPassthrough += 1
@@ -461,10 +464,28 @@
                     return .passthrough
                 }
                 if let collectError {
+                    let nsErr = collectError as NSError
                     vfiLog(
                         level: .debug,
-                        "temporal failed: VT process error: \(collectError.localizedDescription)"
+                        "temporal failed: VT process error: \(collectError.localizedDescription) (domain=\(nsErr.domain) code=\(nsErr.code))"
                     )
+                    resetLLFISessionOnQueue()
+                    if effectiveNumFrames > 1 {
+                        llfiForcedMaxFrames = 1
+                        llfiConsecutiveFailures = 0
+                        EnhancementTelemetryCollector.shared.recordDowngrade(
+                            reason: "系统 VT 多帧初始化失败，已降级为 2×"
+                        )
+                    } else {
+                        llfiConsecutiveFailures += 1
+                        if llfiConsecutiveFailures >= 3 {
+                            llfiCooldownUntilNs = DispatchTime.now().uptimeNanoseconds + 15_000_000_000
+                            llfiConsecutiveFailures = 0
+                            EnhancementTelemetryCollector.shared.recordDowngrade(
+                                reason: "系统 VT 插帧不可用，已熔断直通冷却"
+                            )
+                        }
+                    }
                     temporalPassthrough += 1
                     vfiTemporalStatsLogMaybe(
                         seq: seq,
@@ -514,6 +535,7 @@
                     return .passthrough
                 }
                 temporalHit += 1
+                llfiConsecutiveFailures = 0
                 vfiTemporalStatsLogMaybe(
                     seq: seq,
                     scalar: scalar,
